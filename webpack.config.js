@@ -20,7 +20,7 @@ const SUPPORT_FULLY_QUALIFIED_TS_ESM_IMPORTS = {
 };
 const HANDLE_TYPESCRIPT_WITH_TS_LOADER = { test: /\.([cm]?ts|tsx)$/, loader: "ts-loader" };
 
-const OUTPUT_DIRECTORY = 'dist';
+const OUTPUT_DIRECTORY = 'public';
 
 function recursivelyCopy(dir) {
   return {from: dir, to: dir, toType: 'dir'};
