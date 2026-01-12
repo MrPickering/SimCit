@@ -19,6 +19,8 @@ import { MapGenerator } from './mapGenerator.js';
 import { Simulation } from './simulation.js';
 import { SplashCanvas } from './splashCanvas.js';
 import { Storage } from './storage.js';
+import { CloudLoadWindow } from './cloudLoadWindow.js';
+import { CLOUD_LOAD_WINDOW_CLOSED } from './messages.ts';
 
 /*
  *
@@ -59,6 +61,11 @@ function SplashScreen(tileSet, snowTileSet, spriteSheet) {
   $('#splashGenerate').click(regenerateMap.bind(this));
   $('#splashPlay').click(acquireNameAndDifficulty.bind(this));
   $('#splashLoad').click(handleLoad.bind(this));
+  $('#splashCloudLoad').click(handleCloudLoad.bind(this));
+
+  // Set up cloud load window
+  this.cloudLoadWindow = new CloudLoadWindow('opaque', 'cloudLoadWindow');
+  this.cloudLoadWindow.addEventListener(CLOUD_LOAD_WINDOW_CLOSED, handleCloudLoadClosure.bind(this));
 
   // Conditionally enable load/save buttons
   $('#saveRequest').prop('disabled', !Storage.canStore);
@@ -96,12 +103,38 @@ var handleLoad = function(e) {
   $('#splashLoad').off('click');
   $('#splashGenerate').off('click');
   $('#splashPlay').off('click');
+  $('#splashCloudLoad').off('click');
 
   // Hide the splashscreen UI
   $('#splash').toggle();
 
   // Launch
   var g = new Game(savedGame, this.tileSet, this.snowTileSet, this.spriteSheet, Simulation.LEVEL_EASY, name);
+};
+
+
+// Opens the cloud load window to let user pick a cloud save
+var handleCloudLoad = function(e) {
+  e.preventDefault();
+  this.cloudLoadWindow.open();
+};
+
+
+// Handles the result of cloud load window
+var handleCloudLoadClosure = function(data) {
+  if (data && data.gameData) {
+    // Remove installed event listeners
+    $('#splashLoad').off('click');
+    $('#splashGenerate').off('click');
+    $('#splashPlay').off('click');
+    $('#splashCloudLoad').off('click');
+
+    // Hide the splashscreen UI
+    $('#splash').toggle();
+
+    // Launch with the cloud-loaded game data
+    var g = new Game(data.gameData, this.tileSet, this.snowTileSet, this.spriteSheet, Simulation.LEVEL_EASY, data.gameData.name);
+  }
 };
 
 
