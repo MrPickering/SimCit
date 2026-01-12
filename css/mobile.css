@@ -289,14 +289,6 @@
   margin-top: 5px;
 }
 
-/* Canvas container for zoom - only applied on mobile */
-@media (max-width: 768px) {
-  #canvasContainer {
-    overflow: hidden;
-    position: relative;
-  }
-}
-
 /* ============================================
    Mobile Media Queries
    ============================================ */
@@ -326,17 +318,23 @@
     display: block;
   }
 
-  /* Adjust main canvas area */
-  main {
+  /* Adjust main canvas area - main IS #canvasContainer */
+  main#canvasContainer {
     position: fixed;
     top: 0;
     bottom: 0;
     left: 0;
     right: 0;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
   }
 
   #wrapper {
+    position: absolute;
     top: 0;
+    left: 0;
+    right: 0;
     bottom: 0;
   }
 

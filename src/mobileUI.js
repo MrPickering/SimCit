@@ -47,6 +47,11 @@ MobileUI.prototype._init = function() {
 
     // Suppress the touch warning dialog
     $('#touchWarnWindow').remove();
+
+    // Trigger resize after mobile layout is applied so canvas recalculates dimensions
+    setTimeout(function() {
+      window.dispatchEvent(new Event('resize'));
+    }, 100);
   } catch (e) {
     console.error('MobileUI init error:', e);
   }
