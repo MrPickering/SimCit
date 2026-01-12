@@ -39,6 +39,8 @@ import { Simulation } from './simulation.js';
 import { Storage } from './storage.js';
 import { Text } from './text.js';
 import { TouchWarnWindow } from './touchWarnWindow.js';
+import { MobileUI } from './mobileUI.js';
+import { TouchInput } from './touchInput.js';
 
 var disasterTimeout = 20 * 1000;
 
@@ -221,9 +223,19 @@ function Game(gameMap, tileSet, snowTileSet, spriteSheet, difficulty, name) {
   this.congratsWindow = new CongratsWindow(opacityLayerID, 'congratsWindow');
   this.congratsWindow.addEventListener(Messages.CONGRATS_WINDOW_CLOSED, this.genericDialogClosure);
 
-  // Listen for touches, so we can warn tablet users
-  this.touchListener = touchListener.bind(this);
-  window.addEventListener('touchstart', this.touchListener, false);
+  // Listen for touches, so we can warn tablet users (disabled for mobile UI)
+  // this.touchListener = touchListener.bind(this);
+  // window.addEventListener('touchstart', this.touchListener, false);
+
+  // Initialize mobile UI and touch controls
+  this.mobileUI = new MobileUI(this.inputStatus);
+  this.touchInput = new TouchInput(this.inputStatus, this.gameCanvas);
+  this.mobileUI.setTouchInput(this.touchInput);
+
+  // Sync mobile UI with desktop info bar
+  setTimeout(function() {
+    self.mobileUI.syncWithDesktop();
+  }, 100);
 
   // Unhide controls
   this.revealControls();
