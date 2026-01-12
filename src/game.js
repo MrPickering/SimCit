@@ -256,7 +256,35 @@ function Game(gameMap, tileSet, snowTileSet, spriteSheet, difficulty, name) {
   this.commonAnimate = commonAnimate.bind(this);
   this.animate = (debug ? debugAnimate : this.commonAnimate).bind(this);
   this.animate();
+
+  // Auto-save setup
+  this._setupAutoSave();
 }
+
+
+Game.prototype._setupAutoSave = function() {
+  var self = this;
+
+  // Auto-save every 60 seconds
+  this._autoSaveInterval = setInterval(function() {
+    if (!self.isPaused && !self.dialogOpen) {
+      self.save();
+      console.log('Auto-saved at', new Date().toLocaleTimeString());
+    }
+  }, 60000);
+
+  // Save when leaving page
+  window.addEventListener('beforeunload', function() {
+    self.save();
+  });
+
+  // Save when page becomes hidden (mobile tab switch)
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) {
+      self.save();
+    }
+  });
+};
 
 
 Game.prototype.save = function() {
