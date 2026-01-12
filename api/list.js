@@ -1,15 +1,8 @@
 import { list } from '@vercel/blob';
 
-export const config = {
-  runtime: 'edge',
-};
-
-export default async function handler(request) {
-  if (request.method !== 'GET') {
-    return new Response(JSON.stringify({ error: 'Method not allowed' }), {
-      status: 405,
-      headers: { 'Content-Type': 'application/json' },
-    });
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
   try {
@@ -26,18 +19,12 @@ export default async function handler(request) {
       };
     });
 
-    return new Response(JSON.stringify({
+    return res.status(200).json({
       success: true,
       saves,
-    }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
     });
   } catch (error) {
     console.error('List error:', error);
-    return new Response(JSON.stringify({ error: 'Failed to list saves' }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return res.status(500).json({ error: 'Failed to list saves' });
   }
 }

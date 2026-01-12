@@ -1,26 +1,15 @@
 import { list } from '@vercel/blob';
 
-export const config = {
-  runtime: 'edge',
-};
-
-export default async function handler(request) {
-  if (request.method !== 'GET') {
-    return new Response(JSON.stringify({ error: 'Method not allowed' }), {
-      status: 405,
-      headers: { 'Content-Type': 'application/json' },
-    });
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
   try {
-    const url = new URL(request.url);
-    const saveId = url.searchParams.get('saveId');
+    const { saveId } = req.query;
 
     if (!saveId) {
-      return new Response(JSON.stringify({ error: 'Missing saveId parameter' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return res.status(400).json({ error: 'Missing saveId parameter' });
     }
 
     // Sanitize saveId to prevent path traversal
@@ -31,29 +20,20 @@ export default async function handler(request) {
     const { blobs } = await list({ prefix });
 
     if (blobs.length === 0) {
-      return new Response(JSON.stringify({ error: 'Save not found' }), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return res.status(404).json({ error: 'Save not found' });
     }
 
     // Fetch the save data from the blob URL
     const response = await fetch(blobs[0].url);
     const gameData = await response.json();
 
-    return new Response(JSON.stringify({
+    return res.status(200).json({
       success: true,
       gameData,
       saveId: sanitizedId,
-    }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
     });
   } catch (error) {
     console.error('Load error:', error);
-    return new Response(JSON.stringify({ error: 'Failed to load game' }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return res.status(500).json({ error: 'Failed to load game' });
   }
 }

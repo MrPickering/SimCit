@@ -1,26 +1,15 @@
 import { put } from '@vercel/blob';
 
-export const config = {
-  runtime: 'edge',
-};
-
-export default async function handler(request) {
-  if (request.method !== 'POST') {
-    return new Response(JSON.stringify({ error: 'Method not allowed' }), {
-      status: 405,
-      headers: { 'Content-Type': 'application/json' },
-    });
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
   try {
-    const body = await request.json();
-    const { saveId, gameData } = body;
+    const { saveId, gameData } = req.body;
 
     if (!saveId || !gameData) {
-      return new Response(JSON.stringify({ error: 'Missing saveId or gameData' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return res.status(400).json({ error: 'Missing saveId or gameData' });
     }
 
     // Sanitize saveId to prevent path traversal
@@ -32,19 +21,13 @@ export default async function handler(request) {
       addRandomSuffix: false,
     });
 
-    return new Response(JSON.stringify({
+    return res.status(200).json({
       success: true,
       url: blob.url,
       saveId: sanitizedId,
-    }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
     });
   } catch (error) {
     console.error('Save error:', error);
-    return new Response(JSON.stringify({ error: 'Failed to save game' }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return res.status(500).json({ error: 'Failed to save game' });
   }
 }
