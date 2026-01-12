@@ -41,6 +41,7 @@ import { Text } from './text.js';
 import { TouchWarnWindow } from './touchWarnWindow.js';
 import { MobileUI } from './mobileUI.js';
 import { TouchInput } from './touchInput.js';
+import { UndoManager } from './undoManager.js';
 
 var disasterTimeout = 20 * 1000;
 
@@ -70,10 +71,25 @@ function Game(gameMap, tileSet, snowTileSet, spriteSheet, difficulty, name) {
 
   this.rci = new RCI('RCIContainer', this.simulation);
 
+  // Initialize undo manager
+  this.undoManager = new UndoManager(this.gameMap);
+
   // Note: must init canvas before inputStatus
   this.gameCanvas = new GameCanvas('canvasContainer');
   this.gameCanvas.init(this.gameMap, this.tileSet, spriteSheet);
   this.inputStatus = new InputStatus(this.gameMap, tileSet.tileWidth);
+
+  // Set undo manager on all tools
+  var gameTools = this.inputStatus.gameTools;
+  var toolNames = ['airport', 'bulldozer', 'coal', 'commercial', 'fire', 'industrial',
+                   'nuclear', 'park', 'police', 'port', 'rail', 'residential',
+                   'road', 'stadium', 'wire'];
+  for (var i = 0; i < toolNames.length; i++) {
+    var tool = gameTools[toolNames[i]];
+    if (tool && tool.setUndoManager) {
+      tool.setUndoManager(this.undoManager);
+    }
+  }
 
   this.dialogOpen = false;
   this._openWindow = null;
@@ -200,6 +216,9 @@ function Game(gameMap, tileSet, snowTileSet, spriteSheet, difficulty, name) {
 
   // And pauses
   this.inputStatus.addEventListener(Messages.SPEED_CHANGE, this.handlePause.bind(this));
+
+  // And undo requests
+  this.inputStatus.addEventListener(Messages.UNDO_REQUESTED, this.handleUndo.bind(this));
 
   // And date changes
   // XXX Not yet activated
@@ -538,6 +557,16 @@ Game.prototype.handlePause = function() {
     this.simulation.setSpeed(Simulation.SPEED_PAUSED);
   else
     this.simulation.setSpeed(this.defaultSpeed);
+};
+
+
+Game.prototype.handleUndo = function() {
+  if (this.undoManager.canUndo()) {
+    this.undoManager.undo();
+    this._notificationBar.news({ subject: 'Undo: Last action reverted' });
+  } else {
+    this._notificationBar.news({ subject: 'Nothing to undo' });
+  }
 };
 
 

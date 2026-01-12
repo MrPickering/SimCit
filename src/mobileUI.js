@@ -114,6 +114,7 @@ MobileUI.prototype._createMobileToolPalette = function() {
 MobileUI.prototype._createMobileQuickActions = function() {
   var html = `
     <div id="mobileQuickActions">
+      <button class="undo-btn" id="mobileUndo" title="Undo">↩</button>
       <button class="pause-btn" id="mobilePause" title="Pause">||</button>
       <button class="menu-btn" id="mobileMenuBtn" title="Menu">...</button>
     </div>
@@ -180,6 +181,12 @@ MobileUI.prototype._bindEvents = function() {
 
     // Close palette
     self.closeToolPalette();
+  });
+
+  // Undo button
+  $('#mobileUndo').on('click touchend', function(e) {
+    e.preventDefault();
+    self.inputStatus._emitEvent(Messages.UNDO_REQUESTED);
   });
 
   // Pause button

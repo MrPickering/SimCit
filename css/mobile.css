@@ -170,6 +170,16 @@
   box-shadow: 0 2px 8px rgba(0,0,0,0.2);
 }
 
+#mobileQuickActions .undo-btn {
+  background-color: #9c27b0;
+  color: white;
+}
+
+#mobileQuickActions .undo-btn:disabled {
+  background-color: #ccc;
+  color: #999;
+}
+
 #mobileQuickActions .pause-btn {
   background-color: #ff9800;
   color: white;

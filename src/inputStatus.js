@@ -72,6 +72,7 @@ var InputStatus = EventEmitter(function(map, tileWidth) {
   $('#settingsRequest').click(settingsHandler.bind(this));
   $('#saveRequest').click(saveHandler.bind(this));
   $('#debugRequest').click(debugHandler.bind(this));
+  $('#undoRequest').click(undoHandler.bind(this));
 });
 
 
@@ -81,6 +82,13 @@ var toolOutputID = '#toolOutput';
 
 var keyDownHandler = function(e) {
   var handled = false;
+
+  // Ctrl+Z for undo
+  if ((e.ctrlKey || e.metaKey) && e.keyCode === 90) {
+    this._emitEvent(Messages.UNDO_REQUESTED);
+    e.preventDefault();
+    return;
+  }
 
   switch (e.keyCode) {
     case 38:
@@ -309,6 +317,7 @@ var evalHandler = makeHandler('EVAL_REQUESTED');
 var screenshotHandler = makeHandler('SCREENSHOT_WINDOW_REQUESTED');
 var settingsHandler = makeHandler('SETTINGS_WINDOW_REQUESTED');
 var saveHandler = makeHandler('SAVE_REQUESTED');
+var undoHandler = makeHandler('UNDO_REQUESTED');
 
 
 export { InputStatus };

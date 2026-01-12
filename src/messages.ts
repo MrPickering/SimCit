@@ -89,6 +89,7 @@ export const TORNADO_SIGHTED = "Tornado sighted";
 export const TOUCH_WINDOW_CLOSED = "Touch Window closed";
 export const TRAFFIC_JAMS = "Traffic jams reported";
 export const TRAIN_CRASHED = "Train crashed";
+export const UNDO_REQUESTED = "Undo requested";
 export const VALVES_UPDATED = "Valves updated";
 export const WELCOME = "Welcome to micropolisJS";
 
