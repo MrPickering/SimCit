@@ -25,6 +25,12 @@ var init = function(cost, map, shouldAutoBulldoze, isDraggable) {
   this._map = map;
   this._worldEffects = new WorldEffects(map);
   this._applicationCost = 0;
+  this._undoManager = null;
+};
+
+
+var setUndoManager = function(undoManager) {
+  this._undoManager = undoManager;
 };
 
 
@@ -53,8 +59,20 @@ var doAutoBulldoze = function(x, y) {
 
 
 var apply = function(budget) {
+  // Capture state before applying if undo manager is available
+  var undoAction = null;
+  if (this._undoManager) {
+    undoAction = this._undoManager.captureState(this._worldEffects);
+  }
+
   this._worldEffects.apply();
   budget.spend(this._applicationCost);
+
+  // Record the undo action after successful application
+  if (this._undoManager && undoAction) {
+    this._undoManager.recordAction(undoAction);
+  }
+
   this.clear();
 };
 
@@ -90,6 +108,7 @@ var BaseToolConstructor = {
   doAutoBulldoze: doAutoBulldoze,
   init: init,
   modifyIfEnoughFunding: modifyIfEnoughFunding,
+  setUndoManager: setUndoManager,
   TOOLRESULT_OK: TOOLRESULT_OK,
   TOOLRESULT_FAILED: TOOLRESULT_FAILED,
   TOOLRESULT_NO_MONEY: TOOLRESULT_NO_MONEY,

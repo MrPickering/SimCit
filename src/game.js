@@ -39,6 +39,9 @@ import { Simulation } from './simulation.js';
 import { Storage } from './storage.js';
 import { Text } from './text.js';
 import { TouchWarnWindow } from './touchWarnWindow.js';
+import { MobileUI } from './mobileUI.js';
+import { TouchInput } from './touchInput.js';
+import { UndoManager } from './undoManager.js';
 
 var disasterTimeout = 20 * 1000;
 
@@ -68,10 +71,25 @@ function Game(gameMap, tileSet, snowTileSet, spriteSheet, difficulty, name) {
 
   this.rci = new RCI('RCIContainer', this.simulation);
 
+  // Initialize undo manager
+  this.undoManager = new UndoManager(this.gameMap);
+
   // Note: must init canvas before inputStatus
   this.gameCanvas = new GameCanvas('canvasContainer');
   this.gameCanvas.init(this.gameMap, this.tileSet, spriteSheet);
   this.inputStatus = new InputStatus(this.gameMap, tileSet.tileWidth);
+
+  // Set undo manager on all tools
+  var gameTools = this.inputStatus.gameTools;
+  var toolNames = ['airport', 'bulldozer', 'coal', 'commercial', 'fire', 'industrial',
+                   'nuclear', 'park', 'police', 'port', 'rail', 'residential',
+                   'road', 'stadium', 'wire'];
+  for (var i = 0; i < toolNames.length; i++) {
+    var tool = gameTools[toolNames[i]];
+    if (tool && tool.setUndoManager) {
+      tool.setUndoManager(this.undoManager);
+    }
+  }
 
   this.dialogOpen = false;
   this._openWindow = null;
@@ -199,6 +217,9 @@ function Game(gameMap, tileSet, snowTileSet, spriteSheet, difficulty, name) {
   // And pauses
   this.inputStatus.addEventListener(Messages.SPEED_CHANGE, this.handlePause.bind(this));
 
+  // And undo requests
+  this.inputStatus.addEventListener(Messages.UNDO_REQUESTED, this.handleUndo.bind(this));
+
   // And date changes
   // XXX Not yet activated
   //this.simulation.addEventListener(Messages.DATE_UPDATED, this.onDateChange.bind(this));
@@ -221,9 +242,19 @@ function Game(gameMap, tileSet, snowTileSet, spriteSheet, difficulty, name) {
   this.congratsWindow = new CongratsWindow(opacityLayerID, 'congratsWindow');
   this.congratsWindow.addEventListener(Messages.CONGRATS_WINDOW_CLOSED, this.genericDialogClosure);
 
-  // Listen for touches, so we can warn tablet users
-  this.touchListener = touchListener.bind(this);
-  window.addEventListener('touchstart', this.touchListener, false);
+  // Listen for touches, so we can warn tablet users (disabled for mobile UI)
+  // this.touchListener = touchListener.bind(this);
+  // window.addEventListener('touchstart', this.touchListener, false);
+
+  // Initialize mobile UI and touch controls
+  this.mobileUI = new MobileUI(this.inputStatus);
+  this.touchInput = new TouchInput(this.inputStatus, this.gameCanvas);
+  this.mobileUI.setTouchInput(this.touchInput);
+
+  // Sync mobile UI with desktop info bar
+  setTimeout(function() {
+    self.mobileUI.syncWithDesktop();
+  }, 100);
 
   // Unhide controls
   this.revealControls();
@@ -244,7 +275,35 @@ function Game(gameMap, tileSet, snowTileSet, spriteSheet, difficulty, name) {
   this.commonAnimate = commonAnimate.bind(this);
   this.animate = (debug ? debugAnimate : this.commonAnimate).bind(this);
   this.animate();
+
+  // Auto-save setup
+  this._setupAutoSave();
 }
+
+
+Game.prototype._setupAutoSave = function() {
+  var self = this;
+
+  // Auto-save every 60 seconds
+  this._autoSaveInterval = setInterval(function() {
+    if (!self.isPaused && !self.dialogOpen) {
+      self.save();
+      console.log('Auto-saved at', new Date().toLocaleTimeString());
+    }
+  }, 60000);
+
+  // Save when leaving page
+  window.addEventListener('beforeunload', function() {
+    self.save();
+  });
+
+  // Save when page becomes hidden (mobile tab switch)
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) {
+      self.save();
+    }
+  });
+};
 
 
 Game.prototype.save = function() {
@@ -498,6 +557,16 @@ Game.prototype.handlePause = function() {
     this.simulation.setSpeed(Simulation.SPEED_PAUSED);
   else
     this.simulation.setSpeed(this.defaultSpeed);
+};
+
+
+Game.prototype.handleUndo = function() {
+  if (this.undoManager.canUndo()) {
+    this.undoManager.undo();
+    this._notificationBar.news({ subject: 'Undo: Last action reverted' });
+  } else {
+    this._notificationBar.news({ subject: 'Nothing to undo' });
+  }
 };
 
 
