@@ -250,17 +250,10 @@
 }
 
 /* ============================================
-   Zoom Controls
+   Zoom Controls - DISABLED (CSS zoom breaks canvas)
    ============================================ */
 #zoomControls {
-  display: none;
-  position: fixed;
-  bottom: 150px;
-  left: 15px;
-  z-index: 50;
-  flex-direction: column;
-  gap: 5px;
-  align-items: center;
+  display: none !important;
 }
 
 #zoomControls button {
@@ -309,8 +302,7 @@
   /* Show mobile UI elements */
   #mobileToolbarToggle,
   #mobileInfoBar,
-  #mobileQuickActions,
-  #zoomControls {
+  #mobileQuickActions {
     display: flex;
   }
 

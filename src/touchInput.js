@@ -123,19 +123,9 @@ TouchInput.prototype._handleTouchMove = function(e) {
   var touches = e.touches;
 
   if (this._pinching && touches.length === 2) {
-    // Handle pinch zoom
-    var dist = this._getPinchDistance(touches);
-    var scale = dist / this._lastPinchDist;
-
-    var newZoom = this._zoom * scale;
-    newZoom = Math.max(this._minZoom, Math.min(this._maxZoom, newZoom));
-
-    if (Math.abs(newZoom - this._zoom) > 0.01) {
-      this._zoom = newZoom;
-      this._applyZoom();
-    }
-
-    this._lastPinchDist = dist;
+    // Pinch zoom disabled - CSS zoom breaks canvas rendering
+    // Just ignore pinch gestures
+    return;
 
   } else if (this._touching && touches.length === 1) {
     var touch = touches[0];
@@ -296,18 +286,16 @@ TouchInput.prototype._showTouchFeedback = function(x, y) {
 };
 
 TouchInput.prototype.zoomIn = function() {
-  this._zoom = Math.min(this._maxZoom, this._zoom + 0.25);
-  this._applyZoom();
+  // CSS zoom breaks canvas rendering - disabled
+  // Instead, move the view to show less area (zoom effect via panning)
 };
 
 TouchInput.prototype.zoomOut = function() {
-  this._zoom = Math.max(this._minZoom, this._zoom - 0.25);
-  this._applyZoom();
+  // CSS zoom breaks canvas rendering - disabled
 };
 
 TouchInput.prototype.resetZoom = function() {
-  this._zoom = 1;
-  this._applyZoom();
+  // CSS zoom breaks canvas rendering - disabled
 };
 
 TouchInput.prototype.getZoom = function() {
