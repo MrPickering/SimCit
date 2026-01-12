@@ -246,7 +246,7 @@ This document lists open-source projects, game engines, libraries, and resources
 ### Tutorials and Guides
 - **Phaser 3 Isometric Tutorial**: https://phaser.io/news/2017/05/creating-isometric-worlds-tutorial-part-1
 - **Tizen Isometric Guide**: Creating isometric worlds with Phaser.js plugin
-- **WADE Engine Tutorial**: Step-by-step isometric game walkthrough
+- **WADE Engine Tutorial**: https://clockworkchilli.com/tutorials/isometric_game.html - Step-by-step isometric game walkthrough
 - **Stack Overflow**: HTML5 Canvas isometric tile rendering examples
 
 ### Community Forums
