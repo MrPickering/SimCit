@@ -117,6 +117,7 @@ MobileUI.prototype._createZoomControls = function() {
     <div id="zoomControls">
       <button id="zoomIn">+</button>
       <button id="zoomOut">-</button>
+      <div id="zoomLevel">100%</div>
     </div>
   `;
   $('body').append(html);

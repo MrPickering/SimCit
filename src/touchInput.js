@@ -22,21 +22,23 @@ var TouchInput = function(inputStatus, gameCanvas) {
   // Pinch zoom state
   this._pinching = false;
   this._lastPinchDist = 0;
-  this._initialZoom = 1;
 
   // Pan state
   this._panning = false;
-  this._panStartX = 0;
-  this._panStartY = 0;
+  this._accumulatedPanX = 0;
+  this._accumulatedPanY = 0;
 
-  // Current zoom level
+  // Current zoom level (CSS scale)
   this._zoom = 1;
   this._minZoom = 0.5;
-  this._maxZoom = 2;
+  this._maxZoom = 2.5;
 
   // Tap detection threshold
-  this._tapThreshold = 10; // pixels
+  this._tapThreshold = 15; // pixels
   this._tapTimeout = 300; // ms
+
+  // How many pixels of drag equals one tile scroll
+  this._panSensitivity = 16; // tile width
 
   // Bind touch event handlers
   this._onTouchStart = this._handleTouchStart.bind(this);
@@ -49,7 +51,11 @@ var TouchInput = function(inputStatus, gameCanvas) {
 
 TouchInput.prototype._init = function() {
   var canvas = document.querySelector(this.canvasID);
-  if (!canvas) return;
+  if (!canvas) {
+    // Try again after a short delay (canvas may not be ready yet)
+    setTimeout(this._init.bind(this), 100);
+    return;
+  }
 
   // Add touch event listeners
   canvas.addEventListener('touchstart', this._onTouchStart, { passive: false });
@@ -59,6 +65,12 @@ TouchInput.prototype._init = function() {
 
   // Prevent default touch behaviors on canvas
   canvas.style.touchAction = 'none';
+
+  // Store reference to canvas element
+  this._canvasEl = canvas;
+
+  // Apply initial zoom
+  this._applyZoom();
 };
 
 TouchInput.prototype._handleTouchStart = function(e) {
@@ -69,15 +81,16 @@ TouchInput.prototype._handleTouchStart = function(e) {
   if (touches.length === 1) {
     // Single touch - could be tap or pan start
     var touch = touches[0];
-    var coords = this._getCanvasCoords(touch);
 
     this._touching = true;
-    this._touchStartX = coords.x;
-    this._touchStartY = coords.y;
-    this._lastTouchX = coords.x;
-    this._lastTouchY = coords.y;
+    this._touchStartX = touch.clientX;
+    this._touchStartY = touch.clientY;
+    this._lastTouchX = touch.clientX;
+    this._lastTouchY = touch.clientY;
     this._touchStartTime = Date.now();
     this._panning = false;
+    this._accumulatedPanX = 0;
+    this._accumulatedPanY = 0;
 
     // Show touch feedback
     this._showTouchFeedback(touch.clientX, touch.clientY);
@@ -88,7 +101,6 @@ TouchInput.prototype._handleTouchStart = function(e) {
     this._touching = false;
     this._panning = false;
     this._lastPinchDist = this._getPinchDistance(touches);
-    this._initialZoom = this._zoom;
   }
 };
 
@@ -105,7 +117,7 @@ TouchInput.prototype._handleTouchMove = function(e) {
     var newZoom = this._zoom * scale;
     newZoom = Math.max(this._minZoom, Math.min(this._maxZoom, newZoom));
 
-    if (newZoom !== this._zoom) {
+    if (Math.abs(newZoom - this._zoom) > 0.01) {
       this._zoom = newZoom;
       this._applyZoom();
     }
@@ -114,10 +126,9 @@ TouchInput.prototype._handleTouchMove = function(e) {
 
   } else if (this._touching && touches.length === 1) {
     var touch = touches[0];
-    var coords = this._getCanvasCoords(touch);
 
-    var dx = coords.x - this._touchStartX;
-    var dy = coords.y - this._touchStartY;
+    var dx = touch.clientX - this._touchStartX;
+    var dy = touch.clientY - this._touchStartY;
     var distance = Math.sqrt(dx * dx + dy * dy);
 
     // Check if we've moved enough to start panning
@@ -126,31 +137,60 @@ TouchInput.prototype._handleTouchMove = function(e) {
     }
 
     if (this._panning) {
-      // Pan the canvas
-      var panDx = coords.x - this._lastTouchX;
-      var panDy = coords.y - this._lastTouchY;
+      // Calculate pan delta
+      var panDx = touch.clientX - this._lastTouchX;
+      var panDy = touch.clientY - this._lastTouchY;
 
-      if (this.gameCanvas && this.gameCanvas.pan) {
-        this.gameCanvas.pan(-panDx, -panDy);
+      // Accumulate pan movement (adjusted for zoom)
+      this._accumulatedPanX += panDx / this._zoom;
+      this._accumulatedPanY += panDy / this._zoom;
+
+      // Move by tiles when accumulated enough
+      var tilesMoved = false;
+
+      while (this._accumulatedPanX > this._panSensitivity) {
+        this.gameCanvas.moveWest();
+        this._accumulatedPanX -= this._panSensitivity;
+        tilesMoved = true;
       }
+      while (this._accumulatedPanX < -this._panSensitivity) {
+        this.gameCanvas.moveEast();
+        this._accumulatedPanX += this._panSensitivity;
+        tilesMoved = true;
+      }
+      while (this._accumulatedPanY > this._panSensitivity) {
+        this.gameCanvas.moveNorth();
+        this._accumulatedPanY -= this._panSensitivity;
+        tilesMoved = true;
+      }
+      while (this._accumulatedPanY < -this._panSensitivity) {
+        this.gameCanvas.moveSouth();
+        this._accumulatedPanY += this._panSensitivity;
+        tilesMoved = true;
+      }
+
+      this._lastTouchX = touch.clientX;
+      this._lastTouchY = touch.clientY;
+
     } else if (this.inputStatus.currentTool && this.inputStatus.currentTool.isDraggable) {
       // Draggable tool (like road) - emit tool clicks while dragging
+      var coords = this._getCanvasCoords(touch);
       var tileWidth = this.inputStatus._tileWidth;
       var x = Math.floor(coords.x / tileWidth);
       var y = Math.floor(coords.y / tileWidth);
 
-      var lastX = Math.floor(this._lastTouchX / tileWidth);
-      var lastY = Math.floor(this._lastTouchY / tileWidth);
+      var startCoords = this._getCanvasCoordsFromClient(this._lastTouchX, this._lastTouchY);
+      var lastX = Math.floor(startCoords.x / tileWidth);
+      var lastY = Math.floor(startCoords.y / tileWidth);
 
       if (x !== lastX || y !== lastY) {
         this.inputStatus.mouseX = coords.x;
         this.inputStatus.mouseY = coords.y;
         this.inputStatus._emitEvent(Messages.TOOL_CLICKED, { x: coords.x, y: coords.y });
+        this._lastTouchX = touch.clientX;
+        this._lastTouchY = touch.clientY;
       }
     }
-
-    this._lastTouchX = coords.x;
-    this._lastTouchY = coords.y;
   }
 };
 
@@ -168,15 +208,16 @@ TouchInput.prototype._handleTouchEnd = function(e) {
     var dy = this._lastTouchY - this._touchStartY;
     var distance = Math.sqrt(dx * dx + dy * dy);
 
-    // Detect tap
+    // Detect tap (short press, small movement)
     if (!this._panning && distance < this._tapThreshold && elapsed < this._tapTimeout) {
       // This is a tap - place tool
       if (this.inputStatus.currentTool) {
-        this.inputStatus.mouseX = this._touchStartX;
-        this.inputStatus.mouseY = this._touchStartY;
+        var coords = this._getCanvasCoordsFromClient(this._touchStartX, this._touchStartY);
+        this.inputStatus.mouseX = coords.x;
+        this.inputStatus.mouseY = coords.y;
         this.inputStatus._emitEvent(Messages.TOOL_CLICKED, {
-          x: this._touchStartX,
-          y: this._touchStartY
+          x: coords.x,
+          y: coords.y
         });
       }
     }
@@ -187,11 +228,22 @@ TouchInput.prototype._handleTouchEnd = function(e) {
 };
 
 TouchInput.prototype._getCanvasCoords = function(touch) {
-  var canvas = document.querySelector(this.canvasID);
+  return this._getCanvasCoordsFromClient(touch.clientX, touch.clientY);
+};
+
+TouchInput.prototype._getCanvasCoordsFromClient = function(clientX, clientY) {
+  var canvas = this._canvasEl || document.querySelector(this.canvasID);
+  if (!canvas) return { x: 0, y: 0 };
+
   var rect = canvas.getBoundingClientRect();
+
+  // Account for zoom when converting coordinates
+  var scaleX = canvas.width / rect.width;
+  var scaleY = canvas.height / rect.height;
+
   return {
-    x: (touch.clientX - rect.left) / this._zoom,
-    y: (touch.clientY - rect.top) / this._zoom
+    x: (clientX - rect.left) * scaleX,
+    y: (clientY - rect.top) * scaleY
   };
 };
 
@@ -202,10 +254,17 @@ TouchInput.prototype._getPinchDistance = function(touches) {
 };
 
 TouchInput.prototype._applyZoom = function() {
-  var canvas = document.querySelector(this.canvasID);
-  if (canvas) {
-    canvas.style.transform = 'scale(' + this._zoom + ')';
-    canvas.style.transformOrigin = 'top left';
+  var canvas = this._canvasEl || document.querySelector(this.canvasID);
+  if (!canvas) return;
+
+  // Apply CSS scale transform for zoom
+  canvas.style.transformOrigin = 'center center';
+  canvas.style.transform = 'scale(' + this._zoom + ')';
+
+  // Update zoom display if exists
+  var zoomDisplay = document.getElementById('zoomLevel');
+  if (zoomDisplay) {
+    zoomDisplay.textContent = Math.round(this._zoom * 100) + '%';
   }
 };
 
@@ -224,18 +283,22 @@ TouchInput.prototype._showTouchFeedback = function(x, y) {
 };
 
 TouchInput.prototype.zoomIn = function() {
-  this._zoom = Math.min(this._maxZoom, this._zoom * 1.2);
+  this._zoom = Math.min(this._maxZoom, this._zoom + 0.25);
   this._applyZoom();
 };
 
 TouchInput.prototype.zoomOut = function() {
-  this._zoom = Math.max(this._minZoom, this._zoom / 1.2);
+  this._zoom = Math.max(this._minZoom, this._zoom - 0.25);
   this._applyZoom();
 };
 
 TouchInput.prototype.resetZoom = function() {
   this._zoom = 1;
   this._applyZoom();
+};
+
+TouchInput.prototype.getZoom = function() {
+  return this._zoom;
 };
 
 export { TouchInput };

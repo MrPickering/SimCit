@@ -260,6 +260,7 @@
   z-index: 50;
   flex-direction: column;
   gap: 5px;
+  align-items: center;
 }
 
 #zoomControls button {
@@ -276,6 +277,26 @@
 
 #zoomControls button:active {
   background-color: #e0e0e0;
+}
+
+#zoomLevel {
+  font-size: 11px;
+  color: #333;
+  background-color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  margin-top: 5px;
+}
+
+/* Canvas container for zoom */
+#canvasContainer {
+  overflow: hidden;
+  position: relative;
+}
+
+#MicropolisCanvas {
+  transition: transform 0.1s ease-out;
 }
 
 /* ============================================
