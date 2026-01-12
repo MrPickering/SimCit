@@ -289,14 +289,12 @@
   margin-top: 5px;
 }
 
-/* Canvas container for zoom */
-#canvasContainer {
-  overflow: hidden;
-  position: relative;
-}
-
-#MicropolisCanvas {
-  transition: transform 0.1s ease-out;
+/* Canvas container for zoom - only applied on mobile */
+@media (max-width: 768px) {
+  #canvasContainer {
+    overflow: hidden;
+    position: relative;
+  }
 }
 
 /* ============================================

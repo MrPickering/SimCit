@@ -11,6 +11,12 @@ var TouchInput = function(inputStatus, gameCanvas) {
   this.gameCanvas = gameCanvas;
   this.canvasID = '#' + GameCanvas.DEFAULT_ID;
 
+  // Only initialize touch controls on touch devices
+  this._isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+  if (!this._isTouchDevice) {
+    return; // Don't initialize on desktop
+  }
+
   // Touch state
   this._touching = false;
   this._lastTouchX = 0;
@@ -45,32 +51,39 @@ var TouchInput = function(inputStatus, gameCanvas) {
   this._onTouchMove = this._handleTouchMove.bind(this);
   this._onTouchEnd = this._handleTouchEnd.bind(this);
 
-  // Initialize
-  this._init();
+  // Initialize after a delay to ensure canvas is ready
+  var self = this;
+  setTimeout(function() {
+    self._init();
+  }, 500);
 };
 
 TouchInput.prototype._init = function() {
-  var canvas = document.querySelector(this.canvasID);
-  if (!canvas) {
-    // Try again after a short delay (canvas may not be ready yet)
-    setTimeout(this._init.bind(this), 100);
-    return;
+  try {
+    var canvas = document.querySelector(this.canvasID);
+    if (!canvas) {
+      // Try again after a short delay (canvas may not be ready yet)
+      setTimeout(this._init.bind(this), 100);
+      return;
+    }
+
+    // Add touch event listeners
+    canvas.addEventListener('touchstart', this._onTouchStart, { passive: false });
+    canvas.addEventListener('touchmove', this._onTouchMove, { passive: false });
+    canvas.addEventListener('touchend', this._onTouchEnd, { passive: false });
+    canvas.addEventListener('touchcancel', this._onTouchEnd, { passive: false });
+
+    // Prevent default touch behaviors on canvas
+    canvas.style.touchAction = 'none';
+
+    // Store reference to canvas element
+    this._canvasEl = canvas;
+
+    // Don't apply initial zoom transform - it breaks canvas rendering
+    // Zoom will be applied only when user actually zooms
+  } catch (e) {
+    console.error('TouchInput init error:', e);
   }
-
-  // Add touch event listeners
-  canvas.addEventListener('touchstart', this._onTouchStart, { passive: false });
-  canvas.addEventListener('touchmove', this._onTouchMove, { passive: false });
-  canvas.addEventListener('touchend', this._onTouchEnd, { passive: false });
-  canvas.addEventListener('touchcancel', this._onTouchEnd, { passive: false });
-
-  // Prevent default touch behaviors on canvas
-  canvas.style.touchAction = 'none';
-
-  // Store reference to canvas element
-  this._canvasEl = canvas;
-
-  // Apply initial zoom
-  this._applyZoom();
 };
 
 TouchInput.prototype._handleTouchStart = function(e) {

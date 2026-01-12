@@ -34,18 +34,22 @@ var MobileUI = EventEmitter(function(inputStatus) {
 });
 
 MobileUI.prototype._init = function() {
-  // Only initialize on mobile
+  // Only initialize on mobile/touch devices
   if (!this._isMobile()) return;
 
-  this._createMobileInfoBar();
-  this._createMobileToolPalette();
-  this._createMobileQuickActions();
-  this._createZoomControls();
-  this._createMobileMenu();
-  this._bindEvents();
+  try {
+    this._createMobileInfoBar();
+    this._createMobileToolPalette();
+    this._createMobileQuickActions();
+    this._createZoomControls();
+    this._createMobileMenu();
+    this._bindEvents();
 
-  // Suppress the touch warning dialog
-  $('#touchWarnWindow').remove();
+    // Suppress the touch warning dialog
+    $('#touchWarnWindow').remove();
+  } catch (e) {
+    console.error('MobileUI init error:', e);
+  }
 };
 
 MobileUI.prototype._isMobile = function() {
