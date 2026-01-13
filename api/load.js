@@ -6,21 +6,26 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { saveId } = req.query;
+    const { code } = req.query;
 
-    if (!saveId) {
-      return res.status(400).json({ error: 'Missing saveId parameter' });
+    if (!code) {
+      return res.status(400).json({ error: 'Missing access code' });
     }
 
-    // Sanitize saveId to prevent path traversal
-    const sanitizedId = saveId.replace(/[^a-zA-Z0-9-_]/g, '');
-    const prefix = `saves/${sanitizedId}.json`;
+    // Sanitize code - only allow alphanumeric, uppercase
+    const sanitizedCode = code.toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+    if (sanitizedCode.length !== 6) {
+      return res.status(400).json({ error: 'Invalid access code format' });
+    }
+
+    const prefix = `saves/${sanitizedCode}.json`;
 
     // List blobs to find the exact file
     const { blobs } = await list({ prefix });
 
     if (blobs.length === 0) {
-      return res.status(404).json({ error: 'Save not found' });
+      return res.status(404).json({ error: 'Save not found. Check your access code.' });
     }
 
     // Fetch the save data from the blob URL
@@ -30,7 +35,6 @@ export default async function handler(req, res) {
     return res.status(200).json({
       success: true,
       gameData,
-      saveId: sanitizedId,
     });
   } catch (error) {
     console.error('Load error:', error);

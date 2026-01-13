@@ -24,8 +24,8 @@ var CloudSaveWindow = ModalWindow(function() {
 
 
 var cloudSaveFormID = '#cloudSaveForm';
-var cloudSaveInputID = '#cloudSaveId';
 var cloudSaveStatusID = '#cloudSaveStatus';
+var cloudSaveCodeID = '#cloudSaveCode';
 var cloudSaveOKID = '#cloudSaveOK';
 var cloudSaveCancelID = '#cloudSaveCancel';
 
@@ -33,22 +33,32 @@ var cloudSaveCancelID = '#cloudSaveCancel';
 var submit = async function(e) {
   e.preventDefault();
 
-  var saveId = $(cloudSaveInputID).val().trim();
-  if (!saveId) {
-    $(cloudSaveStatusID).text('Please enter a save name').css('color', 'red');
+  // If we already have a code displayed, just close
+  if (this._savedCode) {
+    this.close(true);
     return;
   }
 
   $(cloudSaveStatusID).text('Saving to cloud...').css('color', 'black');
   $(cloudSaveOKID).prop('disabled', true);
+  $(cloudSaveCodeID).text('');
 
   try {
     var gameData = this._getGameData();
-    await Storage.saveToCloud(saveId, gameData);
-    $(cloudSaveStatusID).text('Saved successfully!').css('color', 'green');
-    setTimeout(function() {
-      this.close(true);
-    }.bind(this), 1000);
+    var accessCode = await Storage.saveToCloud(gameData);
+    this._savedCode = accessCode;
+
+    $(cloudSaveStatusID).html('Saved! Your access code is:').css('color', 'green');
+    $(cloudSaveCodeID).text(accessCode).css({
+      'font-size': '24px',
+      'font-weight': 'bold',
+      'letter-spacing': '4px',
+      'user-select': 'all',
+      'padding': '10px',
+      'background': '#f0f0f0',
+      'border-radius': '4px'
+    });
+    $(cloudSaveOKID).val('Close').prop('disabled', false);
   } catch (error) {
     $(cloudSaveStatusID).text('Error: ' + error.message).css('color', 'red');
     $(cloudSaveOKID).prop('disabled', false);
@@ -63,9 +73,10 @@ var cancel = function(e) {
 
 
 CloudSaveWindow.prototype.close = function(success) {
-  $(cloudSaveInputID).val('');
   $(cloudSaveStatusID).text('');
-  $(cloudSaveOKID).prop('disabled', false);
+  $(cloudSaveCodeID).text('');
+  $(cloudSaveOKID).val('Save to Cloud').prop('disabled', false);
+  this._savedCode = null;
   this._toggleDisplay();
   this._emitEvent(CLOUD_SAVE_WINDOW_CLOSED, { success: success });
 };
@@ -73,8 +84,10 @@ CloudSaveWindow.prototype.close = function(success) {
 
 CloudSaveWindow.prototype.open = function(getGameDataFn) {
   this._getGameData = getGameDataFn;
+  this._savedCode = null;
+  $(cloudSaveStatusID).text('Click "Save to Cloud" to get your access code.');
   this._toggleDisplay();
-  $(cloudSaveInputID).focus();
+  $(cloudSaveOKID).focus();
 };
 
 

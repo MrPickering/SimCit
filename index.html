@@ -397,11 +397,8 @@
         </header>
         <div id="cloudSaveContainer" class="alignCenter padding10 open">
           <form id="cloudSaveForm">
-            <div id="cloudSaveInputContainer" class="padding10">
-              <label for="cloudSaveId">Save name (letters, numbers, dashes):</label>
-              <input type="text" id="cloudSaveId" class="margin10" maxlength="30" pattern="[a-zA-Z0-9\-_]+" required>
-            </div>
             <div id="cloudSaveStatus" class="padding10"></div>
+            <div id="cloudSaveCode" class="alignCenter padding10"></div>
             <div id="cloudSaveButtons" class="alignCenter margin10">
               <button id="cloudSaveCancel" class="cancel">Cancel</button>
               <input type="submit" id="cloudSaveOK" class="dialogOK" value="Save to Cloud">
@@ -414,16 +411,16 @@
           Cloud Load
         </header>
         <div id="cloudLoadContainer" class="alignCenter padding10 open">
-          <div id="cloudLoadInputContainer" class="padding10">
-            <label for="cloudLoadSelect">Select a saved game:</label>
-            <select id="cloudLoadSelect" class="margin10">
-              <option value="">Loading...</option>
-            </select>
-          </div>
-          <div id="cloudLoadStatus" class="padding10"></div>
-          <form id="cloudLoadForm" class="alignCenter margin10">
-            <button id="cloudLoadCancel" class="cancel">Cancel</button>
-            <input type="submit" id="cloudLoadOK" class="dialogOK" value="Load from Cloud">
+          <form id="cloudLoadForm">
+            <div id="cloudLoadInputContainer" class="padding10">
+              <label for="cloudLoadCode">Enter your 6-character access code:</label>
+              <input type="text" id="cloudLoadCode" class="margin10" maxlength="6" style="font-size: 18px; letter-spacing: 4px; text-transform: uppercase; width: 120px; text-align: center;" required>
+            </div>
+            <div id="cloudLoadStatus" class="padding10"></div>
+            <div id="cloudLoadButtons" class="alignCenter margin10">
+              <button id="cloudLoadCancel" class="cancel">Cancel</button>
+              <input type="submit" id="cloudLoadOK" class="dialogOK" value="Load from Cloud">
+            </div>
           </form>
         </div>
       </div>

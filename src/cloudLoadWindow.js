@@ -24,7 +24,7 @@ var CloudLoadWindow = ModalWindow(function() {
 
 
 var cloudLoadFormID = '#cloudLoadForm';
-var cloudLoadSelectID = '#cloudLoadSelect';
+var cloudLoadCodeID = '#cloudLoadCode';
 var cloudLoadStatusID = '#cloudLoadStatus';
 var cloudLoadOKID = '#cloudLoadOK';
 var cloudLoadCancelID = '#cloudLoadCancel';
@@ -33,9 +33,14 @@ var cloudLoadCancelID = '#cloudLoadCancel';
 var submit = async function(e) {
   e.preventDefault();
 
-  var saveId = $(cloudLoadSelectID).val();
-  if (!saveId) {
-    $(cloudLoadStatusID).text('Please select a save').css('color', 'red');
+  var accessCode = $(cloudLoadCodeID).val().trim().toUpperCase();
+  if (!accessCode) {
+    $(cloudLoadStatusID).text('Please enter an access code').css('color', 'red');
+    return;
+  }
+
+  if (accessCode.length !== 6) {
+    $(cloudLoadStatusID).text('Access code must be 6 characters').css('color', 'red');
     return;
   }
 
@@ -43,7 +48,7 @@ var submit = async function(e) {
   $(cloudLoadOKID).prop('disabled', true);
 
   try {
-    var gameData = await Storage.loadFromCloud(saveId);
+    var gameData = await Storage.loadFromCloud(accessCode);
     $(cloudLoadStatusID).text('Loaded successfully!').css('color', 'green');
     setTimeout(function() {
       this.close(gameData);
@@ -62,6 +67,7 @@ var cancel = function(e) {
 
 
 CloudLoadWindow.prototype.close = function(gameData) {
+  $(cloudLoadCodeID).val('');
   $(cloudLoadStatusID).text('');
   $(cloudLoadOKID).prop('disabled', false);
   this._toggleDisplay();
@@ -69,34 +75,10 @@ CloudLoadWindow.prototype.close = function(gameData) {
 };
 
 
-CloudLoadWindow.prototype.open = async function() {
+CloudLoadWindow.prototype.open = function() {
   this._toggleDisplay();
-  $(cloudLoadStatusID).text('Loading saves...').css('color', 'black');
-  $(cloudLoadSelectID).html('<option value="">Loading...</option>');
-
-  try {
-    var saves = await Storage.listCloudSaves();
-    $(cloudLoadSelectID).empty();
-
-    if (saves.length === 0) {
-      $(cloudLoadSelectID).append('<option value="">No saves found</option>');
-      $(cloudLoadStatusID).text('No cloud saves found').css('color', 'gray');
-    } else {
-      $(cloudLoadSelectID).append('<option value="">Select a save...</option>');
-      saves.forEach(function(save) {
-        var date = new Date(save.uploadedAt).toLocaleString();
-        $(cloudLoadSelectID).append(
-          $('<option></option>').val(save.saveId).text(save.saveId + ' (' + date + ')')
-        );
-      });
-      $(cloudLoadStatusID).text('');
-    }
-  } catch (error) {
-    $(cloudLoadSelectID).html('<option value="">Error loading saves</option>');
-    $(cloudLoadStatusID).text('Error: ' + error.message).css('color', 'red');
-  }
-
-  $(cloudLoadSelectID).focus();
+  $(cloudLoadStatusID).text('');
+  $(cloudLoadCodeID).val('').focus();
 };
 
 

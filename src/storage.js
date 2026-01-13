@@ -62,7 +62,7 @@ var transitionOldSave = function(savedGame) {
 
 
 // Cloud storage functions
-var saveToCloud = async function(saveId, gameData) {
+var saveToCloud = async function(gameData) {
   gameData.version = this.CURRENT_VERSION;
 
   const response = await fetch('/api/save', {
@@ -70,7 +70,7 @@ var saveToCloud = async function(saveId, gameData) {
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ saveId, gameData }),
+    body: JSON.stringify({ gameData }),
   });
 
   if (!response.ok) {
@@ -78,12 +78,13 @@ var saveToCloud = async function(saveId, gameData) {
     throw new Error(error.error || 'Failed to save to cloud');
   }
 
-  return response.json();
+  const result = await response.json();
+  return result.accessCode;
 };
 
 
-var loadFromCloud = async function(saveId) {
-  const response = await fetch(`/api/load?saveId=${encodeURIComponent(saveId)}`);
+var loadFromCloud = async function(accessCode) {
+  const response = await fetch(`/api/load?code=${encodeURIComponent(accessCode)}`);
 
   if (!response.ok) {
     const error = await response.json();
@@ -101,26 +102,12 @@ var loadFromCloud = async function(saveId) {
 };
 
 
-var listCloudSaves = async function() {
-  const response = await fetch('/api/list');
-
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || 'Failed to list cloud saves');
-  }
-
-  const result = await response.json();
-  return result.saves;
-};
-
-
 var Storage = {
   getSavedGame: getSavedGame,
   saveGame: saveGame,
   transitionOldSave: transitionOldSave,
   saveToCloud: saveToCloud,
-  loadFromCloud: loadFromCloud,
-  listCloudSaves: listCloudSaves
+  loadFromCloud: loadFromCloud
 };
 
 
