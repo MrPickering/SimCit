@@ -15,6 +15,8 @@ import $ from "jquery";
 
 import { BaseTool } from './baseTool.js';
 import { BudgetWindow } from './budgetWindow.js';
+import { CloudLoadWindow } from './cloudLoadWindow.js';
+import { CloudSaveWindow } from './cloudSaveWindow.js';
 import { Config } from './config.js';
 import { CongratsWindow } from './congratsWindow.js';
 import { DebugWindow } from './debugWindow.js';
@@ -188,6 +190,16 @@ function Game(gameMap, tileSet, snowTileSet, spriteSheet, difficulty, name) {
   // ... the save confirmation window
   this.saveWindow = new SaveWindow(opacityLayerID, 'saveWindow');
   this.saveWindow.addEventListener(Messages.SAVE_WINDOW_CLOSED, this.genericDialogClosure);
+
+  // ... the cloud save window
+  this.cloudSaveWindow = new CloudSaveWindow(opacityLayerID, 'cloudSaveWindow');
+  this.cloudSaveWindow.addEventListener(Messages.CLOUD_SAVE_WINDOW_CLOSED, this.handleCloudSaveWindowClosure.bind(this));
+  this.inputStatus.addEventListener(Messages.CLOUD_SAVE_REQUESTED, this.handleCloudSaveRequest.bind(this));
+
+  // ... the cloud load window
+  this.cloudLoadWindow = new CloudLoadWindow(opacityLayerID, 'cloudLoadWindow');
+  this.cloudLoadWindow.addEventListener(Messages.CLOUD_LOAD_WINDOW_CLOSED, this.handleCloudLoadWindowClosure.bind(this));
+  this.inputStatus.addEventListener(Messages.CLOUD_LOAD_REQUESTED, this.handleCloudLoadRequest.bind(this));
 
   // ... the nag confirmation window
   this.nagWindow = new NagWindow(opacityLayerID, 'nagWindow');
@@ -544,6 +556,55 @@ Game.prototype.handleSave = function() {
   this.dialogOpen = true;
   this._openWindow = 'saveWindow';
   this.saveWindow.open();
+};
+
+
+Game.prototype.handleCloudSaveRequest = function() {
+  if (this.dialogOpen) return;
+
+  this.dialogOpen = true;
+  this._openWindow = 'cloudSaveWindow';
+
+  var self = this;
+  this.cloudSaveWindow.open(function() {
+    var saveData = {name: self.name, everClicked: self.everClicked};
+    BaseTool.save(saveData);
+    self.simulation.save(saveData);
+    return saveData;
+  });
+};
+
+
+Game.prototype.handleCloudSaveWindowClosure = function(data) {
+  this.dialogOpen = false;
+  this._openWindow = null;
+
+  if (data && data.success) {
+    this._notificationBar.news({ subject: 'Game saved to cloud!' });
+  }
+};
+
+
+Game.prototype.handleCloudLoadRequest = function() {
+  if (this.dialogOpen) return;
+
+  this.dialogOpen = true;
+  this._openWindow = 'cloudLoadWindow';
+  this.cloudLoadWindow.open();
+};
+
+
+Game.prototype.handleCloudLoadWindowClosure = function(data) {
+  this.dialogOpen = false;
+  this._openWindow = null;
+
+  if (data && data.gameData) {
+    // Load the game data
+    this.load(data.gameData);
+    this.simulation.load(data.gameData);
+    this.gameCanvas.paint(null, null, this.isPaused);
+    this._notificationBar.news({ subject: 'Game loaded from cloud!' });
+  }
 };
 
 

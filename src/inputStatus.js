@@ -73,6 +73,8 @@ var InputStatus = EventEmitter(function(map, tileWidth) {
   $('#saveRequest').click(saveHandler.bind(this));
   $('#debugRequest').click(debugHandler.bind(this));
   $('#undoRequest').click(undoHandler.bind(this));
+  $('#cloudSaveRequest').click(cloudSaveHandler.bind(this));
+  $('#cloudLoadRequest').click(cloudLoadHandler.bind(this));
 });
 
 
@@ -318,6 +320,8 @@ var screenshotHandler = makeHandler('SCREENSHOT_WINDOW_REQUESTED');
 var settingsHandler = makeHandler('SETTINGS_WINDOW_REQUESTED');
 var saveHandler = makeHandler('SAVE_REQUESTED');
 var undoHandler = makeHandler('UNDO_REQUESTED');
+var cloudSaveHandler = makeHandler('CLOUD_SAVE_REQUESTED');
+var cloudLoadHandler = makeHandler('CLOUD_LOAD_REQUESTED');
 
 
 export { InputStatus };
