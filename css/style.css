@@ -551,28 +551,6 @@ nav li {
   color: white;
 }
 
-/* Cloud save/load buttons - smaller size */
-.cloudSave {
-  background-color: #4a90d9;
-  color: white;
-  font-size: 10px;
-  height: 14px;
-  width: 65px;
-  display: inline-block;
-  margin: 2px;
-}
-
-#cloudSaveRequest, #cloudLoadRequest {
-  width: 65px;
-}
-
-/* Cloud buttons container - put them on one row */
-.cloudButtonRow {
-  display: flex;
-  justify-content: center;
-  gap: 4px;
-}
-
 /* Tool buttons */
 #airportButton {
   background-color: violet;
