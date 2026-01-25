@@ -54,7 +54,12 @@ function SplashScreen(tileSet, snowTileSet, spriteSheet) {
   this.tileSet = tileSet;
   this.snowTileSet = snowTileSet;
   this.spriteSheet = spriteSheet;
-  this.map = MapGenerator();
+
+  // Get initial map size from dropdown
+  var size = getSelectedMapSize();
+  this.mapWidth = size.width;
+  this.mapHeight = size.height;
+  this.map = MapGenerator(this.mapWidth, this.mapHeight);
 
   // Set up listeners on buttons. When play is clicked, we will move on to get the player's desired
   // difficulty level and city name before launching the game properly
@@ -62,6 +67,7 @@ function SplashScreen(tileSet, snowTileSet, spriteSheet) {
   $('#splashPlay').click(acquireNameAndDifficulty.bind(this));
   $('#splashLoad').click(handleLoad.bind(this));
   $('#splashCloudLoad').click(handleCloudLoad.bind(this));
+  $('#mapSize').change(handleMapSizeChange.bind(this));
 
   // Set up cloud load window
   this.cloudLoadWindow = new CloudLoadWindow('opaque', 'cloudLoadWindow');
@@ -81,11 +87,32 @@ function SplashScreen(tileSet, snowTileSet, spriteSheet) {
 }
 
 
+// Parse the map size from the dropdown
+var getSelectedMapSize = function() {
+  var sizeStr = $('#mapSize').val() || '120x100';
+  var parts = sizeStr.split('x');
+  return {
+    width: parseInt(parts[0], 10),
+    height: parseInt(parts[1], 10)
+  };
+};
+
+
+// Handle map size dropdown change
+var handleMapSizeChange = function(e) {
+  var size = getSelectedMapSize();
+  this.mapWidth = size.width;
+  this.mapHeight = size.height;
+  this.map = MapGenerator(this.mapWidth, this.mapHeight);
+  this.splashCanvas.paint(this.map);
+};
+
+
 // Generate a new map at the user's request, and paint it
 var regenerateMap = function(e) {
   e.preventDefault();
 
-  this.map = MapGenerator();
+  this.map = MapGenerator(this.mapWidth, this.mapHeight);
   this.splashCanvas.paint(this.map);
 };
 
