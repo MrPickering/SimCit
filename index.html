@@ -51,7 +51,16 @@
           <div id="splashContainer"></div>
           <div id="splashButtonContainer">
             <div id="splashButtons">
+              <div id="mapSizeSelect" class="margin10">
+                Map Size:
+                <select id="mapSize">
+                  <option value="60x50">Small (60x50)</option>
+                  <option value="120x100" selected>Medium (120x100)</option>
+                  <option value="240x200">Large (240x200)</option>
+                </select>
+              </div>
               <button id="splashLoad" class="width140 block loadSave splashButton" disabled>Load game</button>
+              <button id="splashCloudLoad" class="width140 block margin10 cloudSave splashButton">Load from Cloud</button>
               <button id="splashPlay" class="width140 block margin10 splashButton">Play this map</button>
               <button id="splashGenerate" class="width140 block margin10 splashButton">Generate another</button>
             </div>
@@ -106,6 +115,12 @@
             </div>
             <div>
               <button id="saveRequest" class="miscButton loadSave" disabled>Save</button>
+            </div>
+            <div>
+              <button id="cloudSaveRequest" class="miscButton cloudSave">Cloud Save</button>
+            </div>
+            <div>
+              <button id="cloudLoadRequest" class="miscButton cloudSave">Cloud Load</button>
             </div>
             <div>
               <button id="settingsRequest" class="miscButton">Settings</button>
@@ -381,6 +396,39 @@
           Game Saved!
           <form id="saveForm" class="alignCenter margin10">
             <input type="submit" id="saveOK" class="dialogOK" value="OK">
+          </form>
+        </div>
+      </div>
+      <div class="hidden modal shadow" id="cloudSaveWindow">
+        <header id="cloudSaveHeader" class="cloudSaveHeader padding10 chunk alignCenter">
+          Cloud Save
+        </header>
+        <div id="cloudSaveContainer" class="alignCenter padding10 open">
+          <form id="cloudSaveForm">
+            <div id="cloudSaveStatus" class="padding10"></div>
+            <div id="cloudSaveCode" class="alignCenter padding10"></div>
+            <div id="cloudSaveButtons" class="alignCenter margin10">
+              <button id="cloudSaveCancel" class="cancel">Cancel</button>
+              <input type="submit" id="cloudSaveOK" class="dialogOK" value="Save to Cloud">
+            </div>
+          </form>
+        </div>
+      </div>
+      <div class="hidden modal shadow" id="cloudLoadWindow">
+        <header id="cloudLoadHeader" class="cloudLoadHeader padding10 chunk alignCenter">
+          Cloud Load
+        </header>
+        <div id="cloudLoadContainer" class="alignCenter padding10 open">
+          <form id="cloudLoadForm">
+            <div id="cloudLoadInputContainer" class="padding10">
+              <label for="cloudLoadCode">Enter your 6-character access code:</label>
+              <input type="text" id="cloudLoadCode" class="margin10" maxlength="6" style="font-size: 18px; letter-spacing: 4px; text-transform: uppercase; width: 120px; text-align: center;" required>
+            </div>
+            <div id="cloudLoadStatus" class="padding10"></div>
+            <div id="cloudLoadButtons" class="alignCenter margin10">
+              <button id="cloudLoadCancel" class="cancel">Cancel</button>
+              <input type="submit" id="cloudLoadOK" class="dialogOK" value="Load from Cloud">
+            </div>
           </form>
         </div>
       </div>
