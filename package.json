@@ -37,6 +37,7 @@
   "license": "GPL-3.0",
   "readmeFilename": "README.md",
   "dependencies": {
+    "@vercel/blob": "^0.27.0",
     "jquery": "3.7.1"
   }
 }
