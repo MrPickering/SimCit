@@ -92,6 +92,10 @@ export const TRAIN_CRASHED = "Train crashed";
 export const UNDO_REQUESTED = "Undo requested";
 export const VALVES_UPDATED = "Valves updated";
 export const WELCOME = "Welcome to micropolisJS";
+export const CLOUD_SAVE_REQUESTED = "Cloud save requested";
+export const CLOUD_SAVE_WINDOW_CLOSED = "Cloud save window closed";
+export const CLOUD_LOAD_REQUESTED = "Cloud load requested";
+export const CLOUD_LOAD_WINDOW_CLOSED = "Cloud load window closed";
 
 export const DISASTER_MESSAGES = [
   EARTHQUAKE,
