@@ -87,19 +87,43 @@ SplashCanvas.prototype._paintTile = function(tileVal, x, y, ctx) {
 
 // Loop through the given map, painting each tile scaled down
 SplashCanvas.prototype.paint = function(map) {
+  // Calculate scale to fit map in max dimensions while maintaining aspect ratio
+  var maxWidth = SplashCanvas.MAX_WIDTH;
+  var maxHeight = SplashCanvas.MAX_HEIGHT;
+
+  // Calculate scale based on map size (target ~3px per tile for medium map)
+  var scaleX = maxWidth / map.width;
+  var scaleY = maxHeight / map.height;
+  var scale = Math.min(scaleX, scaleY);
+  scale = Math.max(1, Math.floor(scale)); // At least 1px per tile
+
+  // Resize canvas to fit the map
+  this._canvas.width = map.width * scale;
+  this._canvas.height = map.height * scale;
+  this._scale = scale;
+
   var ctx = this._canvas.getContext('2d');
   ctx.clearRect(0, 0, this._canvas.width, this._canvas.height);
 
   for (var y = 0; y < map.height; y++) {
     for (var x = 0; x < map.width; x++) {
-      this._paintTile(map.getTileValue(x, y), x, y, ctx);
+      this._paintTileScaled(map.getTileValue(x, y), x, y, ctx, scale);
     }
   }
 };
 
 
+// Paint an individual tile at the given map coordinates with specified scale
+SplashCanvas.prototype._paintTileScaled = function(tileVal, x, y, ctx, scale) {
+  var src = this._tileSet[tileVal];
+  ctx.drawImage(src, x * scale, y * scale, scale, scale);
+};
+
+
 SplashCanvas.DEFAULT_WIDTH = 360;
 SplashCanvas.DEFAULT_HEIGHT = 300;
+SplashCanvas.MAX_WIDTH = 360;
+SplashCanvas.MAX_HEIGHT = 300;
 SplashCanvas.DEFAULT_ID = 'SplashCanvas';
 
 
