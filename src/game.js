@@ -44,6 +44,7 @@ import { TouchWarnWindow } from './touchWarnWindow.js';
 import { MobileUI } from './mobileUI.js';
 import { TouchInput } from './touchInput.js';
 import { UndoManager } from './undoManager.js';
+import { AIHelper } from './aiHelper.js';
 
 var disasterTimeout = 20 * 1000;
 
@@ -267,6 +268,9 @@ function Game(gameMap, tileSet, snowTileSet, spriteSheet, difficulty, name) {
   setTimeout(function() {
     self.mobileUI.syncWithDesktop();
   }, 100);
+
+  // Initialize AI Helper
+  this.aiHelper = new AIHelper(this);
 
   // Unhide controls
   this.revealControls();
