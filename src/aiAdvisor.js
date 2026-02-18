@@ -125,19 +125,42 @@ AIAdvisor.prototype._isGridAligned = function(x, y) {
 AIAdvisor.prototype._ensurePlanInitialized = function() {
   if (this._plan.initialized) return;
 
-  // Try to detect grid origin from existing zones
   var map = this.map;
-  for (var y = 2; y < map.height - 2; y++) {
-    for (var x = 2; x < map.width - 2; x++) {
-      var tile = map.getTile(x, y);
-      if (tile.isZone()) {
-        this._plan.initialized = true;
-        this._plan.gridOriginX = x;
-        this._plan.gridOriginY = y;
-        return;
+
+  // Find the main road by looking for the Y coordinate with the most road tiles
+  // This establishes the dividing line: residential north, industrial south
+  var roadCountByY = {};
+  var bestY = -1;
+  var bestCount = 0;
+  var totalRoadX = 0;
+  var totalRoadCount = 0;
+
+  for (var y = 2; y < map.height - 2; y += 1) {
+    var count = 0;
+    for (var x = 2; x < map.width - 2; x += 1) {
+      if (TileUtils.isRoad(map.getTileValue(x, y))) {
+        count++;
+        totalRoadX += x;
+        totalRoadCount++;
       }
     }
+    if (count > bestCount) {
+      bestCount = count;
+      bestY = y;
+    }
   }
+
+  if (bestY !== -1 && totalRoadCount > 0) {
+    this._plan.initialized = true;
+    this._plan.gridOriginX = Math.round(totalRoadX / totalRoadCount);
+    this._plan.gridOriginY = bestY;
+    return;
+  }
+
+  // Fallback: use map center
+  this._plan.initialized = true;
+  this._plan.gridOriginX = this.map.cityCentreX;
+  this._plan.gridOriginY = this.map.cityCentreY;
 };
 
 
@@ -362,14 +385,24 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
     return recs;
   }
 
-  // Follow RCI demand valves
+  // Follow RCI demand valves - check if zone locations exist first
   if (valves.resValve > 100) {
     var urgency = Math.min(valves.resValve / 2000 * 20, 20);
-    recs.push({
-      priority: PRIORITIES.ZONE_DEMAND + urgency,
-      message: 'Residential demand: ' + Math.round(valves.resValve / 20) + '%',
-      action: { type: 'build', tool: 'residential' }
-    });
+    var resLoc = this.findBestZoneLocation('residential');
+    if (resLoc && resLoc.score > -100) {
+      recs.push({
+        priority: PRIORITIES.ZONE_DEMAND + urgency,
+        message: 'Residential demand: ' + Math.round(valves.resValve / 20) + '%',
+        action: { type: 'build', tool: 'residential' }
+      });
+    } else {
+      // No valid residential spot - need to expand grid north
+      recs.push({
+        priority: PRIORITIES.ROAD_CONNECT + 5,
+        message: 'Need more residential space. Expanding grid north.',
+        action: { type: 'expand_grid', zoneType: 'residential' }
+      });
+    }
   }
 
   if (valves.comValve > 100) {
@@ -383,11 +416,21 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
 
   if (valves.indValve > 100) {
     var urgency = Math.min(valves.indValve / 1500 * 15, 15);
-    recs.push({
-      priority: PRIORITIES.ZONE_DEMAND + urgency,
-      message: 'Industrial demand: ' + Math.round(valves.indValve / 15) + '%',
-      action: { type: 'build', tool: 'industrial' }
-    });
+    var indLoc = this.findBestZoneLocation('industrial');
+    if (indLoc && indLoc.score > -100) {
+      recs.push({
+        priority: PRIORITIES.ZONE_DEMAND + urgency,
+        message: 'Industrial demand: ' + Math.round(valves.indValve / 15) + '%',
+        action: { type: 'build', tool: 'industrial' }
+      });
+    } else {
+      // No valid industrial spot - need to expand grid south
+      recs.push({
+        priority: PRIORITIES.ROAD_CONNECT + 5,
+        message: 'Need more industrial space. Expanding grid south.',
+        action: { type: 'expand_grid', zoneType: 'industrial' }
+      });
+    }
   }
 
   // Oversupply warnings
@@ -614,6 +657,67 @@ AIAdvisor.prototype.findBestZoneLocation = function(toolName) {
 
   if (bestX === -1) return null;
   return { x: bestX, y: bestY, score: bestScore };
+};
+
+
+// Find road positions needed to expand the grid for a zone type
+AIAdvisor.prototype.findGridExpansionRoads = function(zoneType) {
+  if (!this._plan.initialized) return null;
+
+  var gx = this._plan.gridOriginX;
+  var gy = this._plan.gridOriginY;
+  var map = this.map;
+  var path = [];
+
+  if (zoneType === 'residential') {
+    // Extend main road east or west, then add a parallel road north
+    // Try extending east first
+    var extendX = gx + 8;
+    while (extendX < map.width - 5 && TileUtils.isRoad(map.getTileValue(extendX, gy))) {
+      extendX += 4;
+    }
+    if (extendX < map.width - 5 && this._isAreaClear(extendX, gy, 4, 1)) {
+      // Extend main road east by 4 tiles
+      for (var rx = extendX; rx < extendX + 4 && rx < map.width; rx++) {
+        path.push({ x: rx, y: gy });
+      }
+      // Add parallel road north at gy-4 for new zone slots
+      for (var rx = extendX; rx < extendX + 4 && rx < map.width; rx++) {
+        if (gy - 4 >= 0) path.push({ x: rx, y: gy - 4 });
+      }
+      return path;
+    }
+
+    // Try extending west
+    extendX = gx - 8;
+    while (extendX >= 2 && TileUtils.isRoad(map.getTileValue(extendX, gy))) {
+      extendX -= 4;
+    }
+    if (extendX >= 2 && this._isAreaClear(extendX - 3, gy, 4, 1)) {
+      for (var rx = extendX; rx > extendX - 4 && rx >= 0; rx--) {
+        path.push({ x: rx, y: gy });
+      }
+      return path;
+    }
+  } else if (zoneType === 'industrial') {
+    // Extend branch road further south or add parallel branches
+    var extendY = gy + 12;
+    while (extendY < map.height - 5 && TileUtils.isRoad(map.getTileValue(gx, extendY))) {
+      extendY += 4;
+    }
+    if (extendY < map.height - 5) {
+      for (var ry = extendY; ry < extendY + 4 && ry < map.height; ry++) {
+        path.push({ x: gx, y: ry });
+      }
+      // Add cross-road at the new depth
+      for (var rx = gx - 2; rx <= gx + 4; rx++) {
+        if (rx !== gx) path.push({ x: rx, y: extendY });
+      }
+      return path;
+    }
+  }
+
+  return null;
 };
 
 
@@ -918,11 +1022,21 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   var traffic = this._safeBlockGet(blockMaps.trafficDensityMap, x, y);
   var popDensity = this._safeBlockGet(blockMaps.populationDensityMap, x, y);
 
+  // HARD POSITIONAL DISTRICT RULES (based on grid origin)
+  // Residential: NORTH of main road only (y <= gridOriginY)
+  // Industrial: SOUTH of main road only (y > gridOriginY)
+  // This prevents mixing regardless of build order
+  if (this._plan.initialized) {
+    var gridY = this._plan.gridOriginY;
+    if (toolName === 'residential' && y > gridY) return -9999;
+    if (toolName === 'industrial' && y <= gridY) return -9999;
+  }
+
   switch (toolName) {
     case 'residential':
       // HARD REJECT: pollution kills residential (degrades at > 128)
       if (pollution > 100) return -9999;
-      // HARD REJECT: industrial within district radius = pollution source
+      // HARD REJECT: industrial within district radius
       if (this._hasNearbyIndustrial(x, y, DISTRICT_RADIUS)) return -9999;
       score += landValue * 2;
       score -= pollution * 4;
@@ -943,6 +1057,10 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
       else score -= 40;
       // Cluster bonus
       if (this._hasNearbyCommercial(x, y, 6)) score += 60;
+      // Prefer near the main road (gridOriginY)
+      if (this._plan.initialized) {
+        score -= Math.abs(y - this._plan.gridOriginY) * 3;
+      }
       break;
 
     case 'industrial':

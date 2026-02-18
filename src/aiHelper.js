@@ -250,6 +250,11 @@ AIHelper.prototype._executeNextAction = function() {
       description = 'Clearing disaster rubble';
       break;
 
+    case 'expand_grid':
+      success = this._expandGrid(action.action.zoneType);
+      description = 'Expanding grid for ' + action.action.zoneType;
+      break;
+
     default:
       break;
   }
@@ -533,6 +538,26 @@ AIHelper.prototype._buildWireConnection = function() {
       success = true;
     } else {
       wireTool.clear();
+    }
+  }
+
+  return success;
+};
+
+
+// Expand the grid to create new zone slots
+AIHelper.prototype._expandGrid = function(zoneType) {
+  var roads = this.advisor.findGridExpansionRoads(zoneType);
+  if (!roads || roads.length === 0) return false;
+
+  var budget = this.simulation.budget;
+  var success = false;
+
+  for (var i = 0; i < roads.length; i++) {
+    if (budget.totalFunds < 515) break;
+    var pos = roads[i];
+    if (this._buildRoadWithWire(pos.x, pos.y)) {
+      success = true;
     }
   }
 
