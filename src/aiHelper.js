@@ -3,15 +3,29 @@
  * Integrates the AI Advisor with the game to provide:
  * 1. An advisory panel with recommendations
  * 2. Auto-play mode that automatically builds and manages the city
+ *
+ * Key behaviors:
+ * - Maintains a $500 fund reserve (never spends below this)
+ * - Adjusts tax rate and service funding automatically
+ * - Adapts action speed to game speed setting
+ * - Builds full road/wire paths in one action
+ * - Tracks unemployment and zone balance
  */
 
 import $ from 'jquery';
 
 import { AIAdvisor } from './aiAdvisor.js';
 import { GameTools } from './gameTools.js';
+import { Simulation } from './simulation.js';
 
-var ACTION_INTERVAL = 2000; // ms between auto-play actions
-var ADVICE_INTERVAL = 5000; // ms between advice refreshes
+// Speed-dependent intervals (ms) for auto-play actions
+var SPEED_INTERVALS = {
+  1: 3000,  // Slow: act every 3s
+  2: 1500,  // Medium: act every 1.5s
+  3: 500    // Fast: act every 0.5s
+};
+
+var ADVICE_INTERVAL = 5000;
 
 function AIHelper(game) {
   this.game = game;
@@ -27,6 +41,7 @@ function AIHelper(game) {
   this._adviceTimer = null;
   this._actionCount = 0;
   this._lastAction = '';
+  this._currentSpeed = this.simulation._speed;
 
   this._initUI();
   this._startAdviceLoop();
@@ -36,7 +51,6 @@ function AIHelper(game) {
 AIHelper.prototype._initUI = function() {
   var self = this;
 
-  // Toggle advice panel
   $('#aiToggle').click(function() {
     $('#aiPanel').toggleClass('ai-hidden');
     var btn = $(this);
@@ -48,12 +62,10 @@ AIHelper.prototype._initUI = function() {
     }
   });
 
-  // Auto-play toggle
   $('#aiAutoPlay').click(function() {
     self.toggleAutoPlay();
   });
 
-  // Refresh advice
   $('#aiRefresh').click(function() {
     self._refreshAdvice();
   });
@@ -77,24 +89,38 @@ AIHelper.prototype.startAutoPlay = function() {
   $('#aiAutoPlay').text('Stop Auto-Play').addClass('ai-active');
   $('#aiStatus').text('Auto-play active...').addClass('ai-status-active');
 
-  var self = this;
-  this._autoPlayTimer = setInterval(function() {
-    if (!self.game.isPaused && !self.game.dialogOpen) {
-      self._executeNextAction();
-    }
-  }, ACTION_INTERVAL);
+  this._scheduleNextAction();
 };
 
 
 AIHelper.prototype.stopAutoPlay = function() {
   this.autoPlayActive = false;
   if (this._autoPlayTimer) {
-    clearInterval(this._autoPlayTimer);
+    clearTimeout(this._autoPlayTimer);
     this._autoPlayTimer = null;
   }
 
   $('#aiAutoPlay').text('Auto-Play').removeClass('ai-active');
   $('#aiStatus').text('Auto-play stopped. ' + this._actionCount + ' actions taken.').removeClass('ai-status-active');
+};
+
+
+// Schedule next action based on current game speed
+AIHelper.prototype._scheduleNextAction = function() {
+  if (!this.autoPlayActive) return;
+
+  var self = this;
+  var speed = this.simulation._speed;
+  var interval = SPEED_INTERVALS[speed] || 2000;
+
+  this._autoPlayTimer = setTimeout(function() {
+    if (self.autoPlayActive) {
+      if (!self.game.isPaused && !self.game.dialogOpen) {
+        self._executeNextAction();
+      }
+      self._scheduleNextAction();
+    }
+  }, interval);
 };
 
 
@@ -123,7 +149,6 @@ AIHelper.prototype._refreshAdvice = function() {
     }
   }
 
-  // Update city stats summary
   this._updateStats();
 };
 
@@ -134,24 +159,33 @@ AIHelper.prototype._updateStats = function() {
   var valves = this.simulation._valves;
   var eval_ = this.simulation.evaluation;
 
-  var rBar = this._makeBar(valves.resValve, 2000);
-  var cBar = this._makeBar(valves.comValve, 1500);
-  var iBar = this._makeBar(valves.indValve, 1500);
+  var rBar = this._makeBar(valves.resValve);
+  var cBar = this._makeBar(valves.comValve);
+  var iBar = this._makeBar(valves.indValve);
 
   var powerZones = census.poweredZoneCount + census.unpoweredZoneCount;
   var powerPct = powerZones > 0 ? Math.round(census.poweredZoneCount / powerZones * 100) : 100;
 
+  // Calculate unemployment for display
+  var jobBase = (census.comPop + census.indPop) * 8;
+  var unemployment = 0;
+  if (jobBase > 0) {
+    unemployment = Math.max(0, Math.round((census.resPop / jobBase - 1) * 100));
+  }
+
   $('#aiStatsContent').html(
     '<div class="ai-stat">Demand: R' + rBar + ' C' + cBar + ' I' + iBar + '</div>' +
     '<div class="ai-stat">Power: ' + powerPct + '% | Crime: ' + (census.crimeAverage || 0) + '</div>' +
-    '<div class="ai-stat">Pollution: ' + (census.pollutionAverage || 0) + ' | Score: ' + eval_.cityScore + '</div>' +
-    '<div class="ai-stat">Cash: $' + budget.totalFunds + ' | Flow: $' + budget.cashFlow + '</div>'
+    '<div class="ai-stat">Traffic: ' + Math.round(census.trafficAverage || 0) + ' | Unemp: ' + unemployment + '%</div>' +
+    '<div class="ai-stat">Score: ' + eval_.cityScore + ' | $' + budget.totalFunds + ' (flow: $' + budget.cashFlow + ')</div>'
   );
 };
 
 
-AIHelper.prototype._makeBar = function(value, max) {
+AIHelper.prototype._makeBar = function(value) {
+  if (value > 500) return '<span class="ai-demand-pos">+++</span>';
   if (value > 100) return '<span class="ai-demand-pos">+</span>';
+  if (value < -1000) return '<span class="ai-demand-neg">---</span>';
   if (value < -100) return '<span class="ai-demand-neg">-</span>';
   return '<span class="ai-demand-neutral">=</span>';
 };
@@ -189,6 +223,21 @@ AIHelper.prototype._executeNextAction = function() {
       description = 'Connecting power lines';
       break;
 
+    case 'set_tax':
+      success = this._setTaxRate(action.action.value);
+      description = 'Set tax to ' + action.action.value + '%';
+      break;
+
+    case 'set_funding':
+      success = this._setFunding(action.action.road, action.action.fire, action.action.police);
+      description = 'Adjusted service funding';
+      break;
+
+    case 'bulldoze_rubble':
+      success = this._bulldozeRubble();
+      description = 'Clearing disaster rubble';
+      break;
+
     default:
       break;
   }
@@ -196,10 +245,30 @@ AIHelper.prototype._executeNextAction = function() {
   if (success) {
     this._actionCount++;
     this._lastAction = description;
-    $('#aiStatus').text('Action #' + this._actionCount + ': ' + description);
+    $('#aiStatus').text('#' + this._actionCount + ': ' + description);
   }
 };
 
+
+// ---- Budget actions (FREE - no spending) ----
+
+AIHelper.prototype._setTaxRate = function(rate) {
+  this.simulation.budget.setTax(rate);
+  return true;
+};
+
+
+AIHelper.prototype._setFunding = function(road, fire, police) {
+  var budget = this.simulation.budget;
+  budget.roadPercent = road;
+  budget.firePercent = fire;
+  budget.policePercent = police;
+  budget.updateFundEffects();
+  return true;
+};
+
+
+// ---- Building actions ----
 
 AIHelper.prototype._buildZone = function(toolName) {
   var budget = this.simulation.budget;
@@ -217,16 +286,13 @@ AIHelper.prototype._buildZone = function(toolName) {
     loc = this.advisor.findBestZoneLocation(toolName);
   }
 
-  if (!loc) return false;
+  if (!loc || loc.score < -100) return false;
 
-  // Try to place the building
   tool.doTool(loc.x, loc.y, this.blockMaps);
   if (tool.result === tool.TOOLRESULT_OK) {
     tool.modifyIfEnoughFunding(budget);
     if (tool.result !== tool.TOOLRESULT_NO_MONEY) {
-      // Also build a connecting road if the zone doesn't have one
       this._ensureRoadAccess(loc.x, loc.y, size);
-      // Also try to wire up power
       this._ensurePowerAccess(loc.x, loc.y, size);
       return true;
     }
@@ -240,11 +306,10 @@ AIHelper.prototype._buildStarterCity = function() {
   var budget = this.simulation.budget;
   if (budget.totalFunds < 1000) return false;
 
-  // Find a good starting spot near the center of the map
   var cx = this.map.cityCentreX;
   var cy = this.map.cityCentreY;
 
-  // Look for a clear area near center
+  // Find a clear area near center
   var startX = -1, startY = -1;
   for (var r = 0; r < 30; r++) {
     for (var dy = -r; dy <= r; dy++) {
@@ -252,7 +317,7 @@ AIHelper.prototype._buildStarterCity = function() {
         if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
         var tx = cx + dx;
         var ty = cy + dy;
-        if (this.advisor._isAreaClear(tx - 2, ty - 2, 12)) {
+        if (this.advisor._isAreaClear(tx - 2, ty - 2, 15)) {
           startX = tx;
           startY = ty;
           break;
@@ -265,61 +330,106 @@ AIHelper.prototype._buildStarterCity = function() {
 
   if (startX === -1) return false;
 
-  // Build a simple starter layout:
-  // Road row at startY
-  // Residential above, commercial and industrial below
-  var roadTool = this.tools.road;
-  var resTool = this.tools.residential;
-  var comTool = this.tools.commercial;
-  var indTool = this.tools.industrial;
+  // Strategy: build SMALL and compact. Don't overspend.
+  // Layout:
+  //   Power plant at top-left, wire row connecting to zones
+  //   Road row through middle
+  //   2 residential above road, 1 commercial + 1 industrial below
 
-  // Lay a horizontal road
-  for (var rx = startX - 2; rx <= startX + 8; rx++) {
+  // Step 1: Power plant if we can afford it ($3000)
+  if (budget.totalFunds >= 5000) {
+    var coalTool = this.tools.coal;
+    coalTool.doTool(startX - 4, startY - 3, this.blockMaps);
+    coalTool.modifyIfEnoughFunding(budget);
+  }
+
+  // Step 2: Short road segment (only 6-8 tiles, not 11)
+  var roadTool = this.tools.road;
+  for (var rx = startX - 1; rx <= startX + 6; rx++) {
     roadTool.doTool(rx, startY, this.blockMaps);
     roadTool.modifyIfEnoughFunding(budget);
   }
 
-  // Place residential above the road
+  // Step 3: Just 1 residential zone to start (don't overspend!)
+  var resTool = this.tools.residential;
   resTool.doTool(startX + 1, startY - 2, this.blockMaps);
   resTool.modifyIfEnoughFunding(budget);
 
-  resTool.doTool(startX + 5, startY - 2, this.blockMaps);
-  resTool.modifyIfEnoughFunding(budget);
+  // Step 4: 1 commercial
+  if (budget.totalFunds >= 600) {
+    var comTool = this.tools.commercial;
+    comTool.doTool(startX + 5, startY - 2, this.blockMaps);
+    comTool.modifyIfEnoughFunding(budget);
+  }
 
-  // Place commercial below the road
-  comTool.doTool(startX + 1, startY + 3, this.blockMaps);
-  comTool.modifyIfEnoughFunding(budget);
+  // Step 5: 1 industrial (placed away from residential)
+  if (budget.totalFunds >= 600) {
+    var indTool = this.tools.industrial;
+    indTool.doTool(startX + 1, startY + 3, this.blockMaps);
+    indTool.modifyIfEnoughFunding(budget);
 
-  // Place industrial further away
-  indTool.doTool(startX + 5, startY + 3, this.blockMaps);
-  indTool.modifyIfEnoughFunding(budget);
+    // Extra road to industrial
+    roadTool.doTool(startX + 1, startY + 1, this.blockMaps);
+    roadTool.modifyIfEnoughFunding(budget);
+  }
 
-  // Build a power plant nearby if we can afford it
-  if (budget.totalFunds >= 3000) {
-    var coalTool = this.tools.coal;
-    coalTool.doTool(startX - 3, startY - 3, this.blockMaps);
-    coalTool.modifyIfEnoughFunding(budget);
-
-    // Connect power with wires
+  // Step 6: Wire from power plant to zones (if plant was built)
+  if (budget.totalFunds >= 50) {
     var wireTool = this.tools.wire;
-    for (var wx = startX - 1; wx <= startX + 6; wx++) {
+    for (var wx = startX - 2; wx <= startX + 5; wx++) {
       wireTool.doTool(wx, startY - 4, this.blockMaps);
       wireTool.modifyIfEnoughFunding(budget);
     }
   }
 
+  // Set tax to 7% (optimal starting rate)
+  this.simulation.budget.setTax(7);
+
   return true;
 };
 
 
+// Build full road path (not just 1 tile)
 AIHelper.prototype._buildRoadConnection = function() {
-  var loc = this.advisor.findRoadToConnect();
-  if (!loc) return false;
+  var pathOrLoc = this.advisor.findRoadToConnect();
+  if (!pathOrLoc) {
+    // If no disconnected zones, try relieving traffic bottlenecks
+    var bottleneck = this.advisor.findTrafficBottleneck();
+    if (bottleneck) {
+      return this._placeRoadAt(bottleneck.x, bottleneck.y);
+    }
+    return false;
+  }
 
+  // pathOrLoc is an array of positions
   var budget = this.simulation.budget;
   var roadTool = this.tools.road;
+  var success = false;
+  var maxRoads = 10; // Cap per action to avoid spending spree
 
-  roadTool.doTool(loc.x, loc.y, this.blockMaps);
+  for (var i = 0; i < Math.min(pathOrLoc.length, maxRoads); i++) {
+    if (budget.totalFunds < 510) break; // Keep $500 reserve + $10 for road
+
+    var pos = pathOrLoc[i];
+    roadTool.doTool(pos.x, pos.y, this.blockMaps);
+    if (roadTool.result === roadTool.TOOLRESULT_OK) {
+      roadTool.modifyIfEnoughFunding(budget);
+      success = true;
+    } else {
+      roadTool.clear();
+    }
+  }
+
+  return success;
+};
+
+
+AIHelper.prototype._placeRoadAt = function(x, y) {
+  var budget = this.simulation.budget;
+  if (budget.totalFunds < 510) return false;
+
+  var roadTool = this.tools.road;
+  roadTool.doTool(x, y, this.blockMaps);
   if (roadTool.result === roadTool.TOOLRESULT_OK) {
     roadTool.modifyIfEnoughFunding(budget);
     return true;
@@ -329,35 +439,64 @@ AIHelper.prototype._buildRoadConnection = function() {
 };
 
 
+// Build full wire path (not just 1 tile)
 AIHelper.prototype._buildWireConnection = function() {
-  var loc = this.advisor.findWireToConnect();
-  if (!loc) return false;
+  var path = this.advisor.findWireToConnect();
+  if (!path || path.length === 0) return false;
 
   var budget = this.simulation.budget;
   var wireTool = this.tools.wire;
+  var success = false;
+  var maxWires = 20; // Cap per action
 
-  wireTool.doTool(loc.x, loc.y, this.blockMaps);
-  if (wireTool.result === wireTool.TOOLRESULT_OK) {
-    wireTool.modifyIfEnoughFunding(budget);
+  for (var i = 0; i < Math.min(path.length, maxWires); i++) {
+    if (budget.totalFunds < 505) break; // Keep $500 reserve + $5 for wire
+
+    var pos = path[i];
+    wireTool.doTool(pos.x, pos.y, this.blockMaps);
+    if (wireTool.result === wireTool.TOOLRESULT_OK) {
+      wireTool.modifyIfEnoughFunding(budget);
+      success = true;
+    } else {
+      wireTool.clear();
+    }
+  }
+
+  return success;
+};
+
+
+AIHelper.prototype._bulldozeRubble = function() {
+  var loc = this.advisor.findRubbleToClear();
+  if (!loc) return false;
+
+  var budget = this.simulation.budget;
+  if (budget.totalFunds < 501) return false;
+
+  var bulldozerTool = this.tools.bulldozer;
+  bulldozerTool.doTool(loc.x, loc.y, this.blockMaps);
+  if (bulldozerTool.result === bulldozerTool.TOOLRESULT_OK) {
+    bulldozerTool.modifyIfEnoughFunding(budget);
     return true;
   }
-  wireTool.clear();
+  bulldozerTool.clear();
   return false;
 };
 
 
 AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
-  // Build roads adjacent to the placed zone if none exist
   if (this.advisor._hasNearbyRoad(x, y, size)) return;
 
   var budget = this.simulation.budget;
+  if (budget.totalFunds < 520) return; // Reserve check
+
   var roadTool = this.tools.road;
   var half = Math.floor(size / 2);
 
-  // Build a road along the bottom edge of the zone
+  // Build a short road segment along the bottom edge
   for (var rx = x - half; rx <= x + half; rx++) {
     var ry = y + half + 1;
-    if (ry < this.map.height) {
+    if (ry < this.map.height && budget.totalFunds >= 510) {
       roadTool.doTool(rx, ry, this.blockMaps);
       roadTool.modifyIfEnoughFunding(budget);
     }
@@ -369,9 +508,9 @@ AIHelper.prototype._ensurePowerAccess = function(x, y, size) {
   if (this.advisor._hasNearbyPower(x, y, size + 2)) return;
 
   var budget = this.simulation.budget;
-  var wireTool = this.tools.wire;
+  if (budget.totalFunds < 505) return; // Reserve check
 
-  // Try to connect by placing a wire adjacent
+  var wireTool = this.tools.wire;
   var dirs = [[0, -1], [1, 0], [0, 1], [-1, 0]];
   for (var i = 0; i < dirs.length; i++) {
     var wx = x + dirs[i][0] * (Math.floor(size / 2) + 1);
@@ -390,9 +529,8 @@ AIHelper.prototype._ensurePowerAccess = function(x, y, size) {
 
 AIHelper.prototype._tryPlacePark = function() {
   var budget = this.simulation.budget;
-  if (budget.totalFunds < 100) return;
+  if (budget.totalFunds < 1000) return; // Don't waste money on parks when low
 
-  // Find a spot near populated areas that could benefit from a park
   var map = this.map;
   var blockMaps = this.blockMaps;
   var bestScore = -Infinity;
@@ -400,9 +538,8 @@ AIHelper.prototype._tryPlacePark = function() {
 
   for (var y = 2; y < map.height - 2; y += 5) {
     for (var x = 2; x < map.width - 2; x += 5) {
-      if (map.getTileValue(x, y) !== 0) continue; // DIRT
+      if (map.getTileValue(x, y) !== 0) continue;
 
-      // Score by nearby population and lack of existing parks
       var pop = this.advisor._safeBlockGet(blockMaps.populationDensityMap, x, y);
       if (pop < 10) continue;
 
@@ -426,7 +563,7 @@ AIHelper.prototype._tryPlacePark = function() {
     parkTool.modifyIfEnoughFunding(budget);
     this._actionCount++;
     this._lastAction = 'Placed park';
-    $('#aiStatus').text('Action #' + this._actionCount + ': Placed park for land value');
+    $('#aiStatus').text('#' + this._actionCount + ': Placed park for land value');
   } else {
     parkTool.clear();
   }
@@ -445,7 +582,7 @@ AIHelper.prototype._getToolSize = function(toolName) {
 
 
 AIHelper.prototype.destroy = function() {
-  if (this._autoPlayTimer) clearInterval(this._autoPlayTimer);
+  if (this._autoPlayTimer) clearTimeout(this._autoPlayTimer);
   if (this._adviceTimer) clearInterval(this._adviceTimer);
 };
 
