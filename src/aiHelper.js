@@ -1,15 +1,28 @@
-/* AI Helper for SimCit
+/* AI Helper for SimCit - Auto-Play Engine
  *
- * Integrates the AI Advisor with the game to provide:
- * 1. An advisory panel with recommendations
- * 2. Auto-play mode that automatically builds and manages the city
+ * Integrates the AI Advisor strategy engine with the game:
+ * 1. Advisory panel with recommendations
+ * 2. Auto-play with optimal city building strategy
+ *
+ * Starter City Layout (T-grid):
+ *   Main road (east-west) at y=gy with wire for power
+ *   Branch road (south) at x=gx with wire for power
+ *   South cross-road at y=gy+8 connecting to power plant
+ *   Residential zones: NORTH of main road (clean area)
+ *   Commercial zone: center, NORTH of main road
+ *   Industrial zone: SOUTH, east of branch (pollution contained)
+ *   Coal power plant: south-east, adjacent to road+wire grid
+ *
+ * Power Strategy:
+ *   Wire on roads creates road+power hybrid tiles (CONDBIT)
+ *   Power propagates: plant → road+wire → zone tiles (CONDBIT)
+ *   All zones adjacent to wired roads get power automatically
  *
  * Key behaviors:
- * - Maintains a $500 fund reserve (never spends below this)
- * - Adjusts tax rate and service funding automatically
- * - Adapts action speed to game speed setting
- * - Builds full road/wire paths in one action
- * - Tracks unemployment and zone balance
+ *   - Maintains fund reserve (phase-dependent)
+ *   - Adapts action speed to game speed
+ *   - Always builds road+wire pairs for power connectivity
+ *   - Strict zone district separation
  */
 
 import $ from 'jquery';
@@ -17,12 +30,12 @@ import $ from 'jquery';
 import { AIAdvisor } from './aiAdvisor.js';
 import { GameTools } from './gameTools.js';
 import { Simulation } from './simulation.js';
+import { TileUtils } from './tileUtils.js';
 
-// Speed-dependent intervals (ms) for auto-play actions
 var SPEED_INTERVALS = {
-  1: 3000,  // Slow: act every 3s
-  2: 1500,  // Medium: act every 1.5s
-  3: 500    // Fast: act every 0.5s
+  1: 3000,
+  2: 1500,
+  3: 500
 };
 
 var ADVICE_INTERVAL = 5000;
@@ -105,7 +118,6 @@ AIHelper.prototype.stopAutoPlay = function() {
 };
 
 
-// Schedule next action based on current game speed
 AIHelper.prototype._scheduleNextAction = function() {
   if (!this.autoPlayActive) return;
 
@@ -166,15 +178,16 @@ AIHelper.prototype._updateStats = function() {
   var powerZones = census.poweredZoneCount + census.unpoweredZoneCount;
   var powerPct = powerZones > 0 ? Math.round(census.poweredZoneCount / powerZones * 100) : 100;
 
-  // Calculate unemployment for display
   var jobBase = (census.comPop + census.indPop) * 8;
   var unemployment = 0;
   if (jobBase > 0) {
     unemployment = Math.max(0, Math.round((census.resPop / jobBase - 1) * 100));
   }
 
+  var phase = this.advisor._getPhase();
+
   $('#aiStatsContent').html(
-    '<div class="ai-stat">Demand: R' + rBar + ' C' + cBar + ' I' + iBar + '</div>' +
+    '<div class="ai-stat">Phase: ' + phase + ' | Demand: R' + rBar + ' C' + cBar + ' I' + iBar + '</div>' +
     '<div class="ai-stat">Power: ' + powerPct + '% | Crime: ' + (census.crimeAverage || 0) + '</div>' +
     '<div class="ai-stat">Traffic: ' + Math.round(census.trafficAverage || 0) + ' | Unemp: ' + unemployment + '%</div>' +
     '<div class="ai-stat">Score: ' + eval_.cityScore + ' | $' + budget.totalFunds + ' (flow: $' + budget.cashFlow + ')</div>'
@@ -194,7 +207,6 @@ AIHelper.prototype._makeBar = function(value) {
 AIHelper.prototype._executeNextAction = function() {
   var action = this.advisor.decideBestAction();
   if (!action) {
-    // Nothing urgent - try placing parks to improve land value
     this._tryPlacePark();
     return;
   }
@@ -205,7 +217,7 @@ AIHelper.prototype._executeNextAction = function() {
   switch (action.action.type) {
     case 'build_starter':
       success = this._buildStarterCity();
-      description = 'Building starter city layout';
+      description = 'Building optimal starter city';
       break;
 
     case 'build':
@@ -250,7 +262,7 @@ AIHelper.prototype._executeNextAction = function() {
 };
 
 
-// ---- Budget actions (FREE - no spending) ----
+// ---- Budget actions (FREE) ----
 
 AIHelper.prototype._setTaxRate = function(rate) {
   this.simulation.budget.setTax(rate);
@@ -268,7 +280,177 @@ AIHelper.prototype._setFunding = function(road, fire, police) {
 };
 
 
-// ---- Building actions ----
+// ---- Core building: road + wire pair ----
+
+AIHelper.prototype._buildRoadWithWire = function(x, y) {
+  var budget = this.simulation.budget;
+  if (budget.totalFunds < 15) return false; // $10 road + $5 wire
+
+  var roadTool = this.tools.road;
+  roadTool.doTool(x, y, this.blockMaps);
+  if (roadTool.result === roadTool.TOOLRESULT_OK) {
+    roadTool.modifyIfEnoughFunding(budget);
+    if (roadTool.result === roadTool.TOOLRESULT_NO_MONEY) return false;
+  } else {
+    roadTool.clear();
+    // Road might already exist - still wire it
+  }
+
+  // Wire on top of road creates road+power hybrid (CONDBIT)
+  var wireTool = this.tools.wire;
+  wireTool.doTool(x, y, this.blockMaps);
+  if (wireTool.result === wireTool.TOOLRESULT_OK) {
+    wireTool.modifyIfEnoughFunding(budget);
+  } else {
+    wireTool.clear();
+  }
+
+  return true;
+};
+
+
+// Wire adjacent road tiles to ensure zone gets power
+AIHelper.prototype._wireAdjacentRoads = function(x, y, size) {
+  var half = Math.floor(size / 2);
+  var wireTool = this.tools.wire;
+  var budget = this.simulation.budget;
+  var map = this.map;
+
+  // Check all perimeter tiles around the zone
+  for (var dy = -(half + 1); dy <= half + 1; dy++) {
+    for (var dx = -(half + 1); dx <= half + 1; dx++) {
+      // Only perimeter
+      if (Math.abs(dx) <= half && Math.abs(dy) <= half) continue;
+      var nx = x + dx;
+      var ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
+        var tv = map.getTileValue(nx, ny);
+        if (TileUtils.isRoad(tv) && !map.getTile(nx, ny).isConductive()) {
+          if (budget.totalFunds >= 505) {
+            wireTool.doTool(nx, ny, this.blockMaps);
+            if (wireTool.result === wireTool.TOOLRESULT_OK) {
+              wireTool.modifyIfEnoughFunding(budget);
+            } else {
+              wireTool.clear();
+            }
+          }
+        }
+      }
+    }
+  }
+};
+
+
+// ---- Starter City: Optimal T-Grid Layout ----
+
+AIHelper.prototype._buildStarterCity = function() {
+  var budget = this.simulation.budget;
+  if (budget.totalFunds < 4000) return false;
+
+  var origin = this.advisor.findStarterLocation();
+  if (!origin) return false;
+
+  var gx = origin.x;
+  var gy = origin.y;
+
+  // Store grid plan
+  this.advisor.initCityPlan(gx, gy);
+
+  // === Step 1: Coal power plant (south-east, near future industrial area) ===
+  // doTool(gx+4, gy+9) → occupies (gx+3, gy+8) to (gx+6, gy+11)
+  // Plant tile at (gx+3, gy+8) will be adjacent to road at (gx+2, gy+8)
+  var coalTool = this.tools.coal;
+  coalTool.doTool(gx + 4, gy + 9, this.blockMaps);
+  if (coalTool.result !== coalTool.TOOLRESULT_OK) {
+    coalTool.clear();
+    // Try alternate position
+    coalTool.doTool(gx - 4, gy + 9, this.blockMaps);
+    if (coalTool.result !== coalTool.TOOLRESULT_OK) {
+      coalTool.clear();
+      return false;
+    }
+  }
+  coalTool.modifyIfEnoughFunding(budget);
+  if (coalTool.result === coalTool.TOOLRESULT_NO_MONEY) return false;
+
+  // === Step 2: Main horizontal road at y=gy (the city spine) ===
+  // 13 tiles from gx-6 to gx+6, with wire on each for power
+  var rx;
+  for (rx = gx - 6; rx <= gx + 6; rx++) {
+    this._buildRoadWithWire(rx, gy);
+  }
+
+  // === Step 3: Branch road south at x=gx (industrial access) ===
+  // 8 tiles from gy+1 to gy+8, with wire
+  var ry;
+  for (ry = gy + 1; ry <= gy + 8; ry++) {
+    this._buildRoadWithWire(gx, ry);
+  }
+
+  // === Step 4: South cross-road at y=gy+8 (power plant connection) ===
+  // 4 tiles from gx-2 to gx+2, excluding gx (already has road)
+  for (rx = gx - 2; rx <= gx + 2; rx++) {
+    if (rx !== gx) {
+      this._buildRoadWithWire(rx, gy + 8);
+    }
+  }
+
+  // === Step 5: Residential zones (NORTH of main road - clean area) ===
+  // Zone at (gx-4, gy-2): occupies (gx-5,gy-3) to (gx-3,gy-1)
+  // South perimeter touches main road at gy → road access ✓
+  // Zone tiles have CONDBIT → power from adjacent road+wire ✓
+  var resTool = this.tools.residential;
+  resTool.doTool(gx - 4, gy - 2, this.blockMaps);
+  if (resTool.result === resTool.TOOLRESULT_OK) {
+    resTool.modifyIfEnoughFunding(budget);
+  } else {
+    resTool.clear();
+  }
+
+  // Second residential zone (east side)
+  if (budget.totalFunds >= 600) {
+    resTool.doTool(gx + 4, gy - 2, this.blockMaps);
+    if (resTool.result === resTool.TOOLRESULT_OK) {
+      resTool.modifyIfEnoughFunding(budget);
+    } else {
+      resTool.clear();
+    }
+  }
+
+  // === Step 6: Commercial zone (center, north of main road) ===
+  if (budget.totalFunds >= 600) {
+    var comTool = this.tools.commercial;
+    comTool.doTool(gx, gy - 2, this.blockMaps);
+    if (comTool.result === comTool.TOOLRESULT_OK) {
+      comTool.modifyIfEnoughFunding(budget);
+    } else {
+      comTool.clear();
+    }
+  }
+
+  // === Step 7: Industrial zone (SOUTH area, east of branch road) ===
+  // Zone at (gx+2, gy+6): occupies (gx+1,gy+5) to (gx+3,gy+7)
+  // West perimeter at x=gx touches branch road → road access ✓
+  // Distance from residential (gx-4,gy-2): ~14 tiles → separation ✓
+  // Distance from residential (gx+4,gy-2): ~10 tiles → separation ✓
+  if (budget.totalFunds >= 600) {
+    var indTool = this.tools.industrial;
+    indTool.doTool(gx + 2, gy + 6, this.blockMaps);
+    if (indTool.result === indTool.TOOLRESULT_OK) {
+      indTool.modifyIfEnoughFunding(budget);
+    } else {
+      indTool.clear();
+    }
+  }
+
+  // === Step 8: Set optimal starting tax rate ===
+  this.simulation.budget.setTax(7);
+
+  return true;
+};
+
+
+// ---- Zone building with power connectivity ----
 
 AIHelper.prototype._buildZone = function(toolName) {
   var budget = this.simulation.budget;
@@ -292,8 +474,10 @@ AIHelper.prototype._buildZone = function(toolName) {
   if (tool.result === tool.TOOLRESULT_OK) {
     tool.modifyIfEnoughFunding(budget);
     if (tool.result !== tool.TOOLRESULT_NO_MONEY) {
+      // Ensure road access (builds road+wire for power too)
       this._ensureRoadAccess(loc.x, loc.y, size);
-      this._ensurePowerAccess(loc.x, loc.y, size);
+      // Wire any adjacent roads that aren't conductive
+      this._wireAdjacentRoads(loc.x, loc.y, size);
       return true;
     }
   }
@@ -302,121 +486,26 @@ AIHelper.prototype._buildZone = function(toolName) {
 };
 
 
-AIHelper.prototype._buildStarterCity = function() {
-  var budget = this.simulation.budget;
-  if (budget.totalFunds < 1000) return false;
-
-  var cx = this.map.cityCentreX;
-  var cy = this.map.cityCentreY;
-
-  // Find a clear area near center
-  var startX = -1, startY = -1;
-  for (var r = 0; r < 30; r++) {
-    for (var dy = -r; dy <= r; dy++) {
-      for (var dx = -r; dx <= r; dx++) {
-        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
-        var tx = cx + dx;
-        var ty = cy + dy;
-        if (this.advisor._isAreaClear(tx - 2, ty - 2, 15)) {
-          startX = tx;
-          startY = ty;
-          break;
-        }
-      }
-      if (startX !== -1) break;
-    }
-    if (startX !== -1) break;
-  }
-
-  if (startX === -1) return false;
-
-  // Strategy: build SMALL and compact. Don't overspend.
-  // Layout:
-  //   Power plant at top-left, wire row connecting to zones
-  //   Road row through middle
-  //   2 residential above road, 1 commercial + 1 industrial below
-
-  // Step 1: Power plant if we can afford it ($3000)
-  if (budget.totalFunds >= 5000) {
-    var coalTool = this.tools.coal;
-    coalTool.doTool(startX - 4, startY - 3, this.blockMaps);
-    coalTool.modifyIfEnoughFunding(budget);
-  }
-
-  // Step 2: Short road segment (only 6-8 tiles, not 11)
-  var roadTool = this.tools.road;
-  for (var rx = startX - 1; rx <= startX + 6; rx++) {
-    roadTool.doTool(rx, startY, this.blockMaps);
-    roadTool.modifyIfEnoughFunding(budget);
-  }
-
-  // Step 3: Just 1 residential zone to start (don't overspend!)
-  var resTool = this.tools.residential;
-  resTool.doTool(startX + 1, startY - 2, this.blockMaps);
-  resTool.modifyIfEnoughFunding(budget);
-
-  // Step 4: 1 commercial
-  if (budget.totalFunds >= 600) {
-    var comTool = this.tools.commercial;
-    comTool.doTool(startX + 5, startY - 2, this.blockMaps);
-    comTool.modifyIfEnoughFunding(budget);
-  }
-
-  // Step 5: 1 industrial (placed away from residential)
-  if (budget.totalFunds >= 600) {
-    var indTool = this.tools.industrial;
-    indTool.doTool(startX + 1, startY + 3, this.blockMaps);
-    indTool.modifyIfEnoughFunding(budget);
-
-    // Extra road to industrial
-    roadTool.doTool(startX + 1, startY + 1, this.blockMaps);
-    roadTool.modifyIfEnoughFunding(budget);
-  }
-
-  // Step 6: Wire from power plant to zones (if plant was built)
-  if (budget.totalFunds >= 50) {
-    var wireTool = this.tools.wire;
-    for (var wx = startX - 2; wx <= startX + 5; wx++) {
-      wireTool.doTool(wx, startY - 4, this.blockMaps);
-      wireTool.modifyIfEnoughFunding(budget);
-    }
-  }
-
-  // Set tax to 7% (optimal starting rate)
-  this.simulation.budget.setTax(7);
-
-  return true;
-};
-
-
-// Build full road path (not just 1 tile)
+// Build road connection (with wire for power)
 AIHelper.prototype._buildRoadConnection = function() {
   var pathOrLoc = this.advisor.findRoadToConnect();
   if (!pathOrLoc) {
-    // If no disconnected zones, try relieving traffic bottlenecks
     var bottleneck = this.advisor.findTrafficBottleneck();
     if (bottleneck) {
-      return this._placeRoadAt(bottleneck.x, bottleneck.y);
+      return this._buildRoadWithWire(bottleneck.x, bottleneck.y);
     }
     return false;
   }
 
-  // pathOrLoc is an array of positions
   var budget = this.simulation.budget;
-  var roadTool = this.tools.road;
   var success = false;
-  var maxRoads = 10; // Cap per action to avoid spending spree
+  var maxRoads = 10;
 
   for (var i = 0; i < Math.min(pathOrLoc.length, maxRoads); i++) {
-    if (budget.totalFunds < 510) break; // Keep $500 reserve + $10 for road
-
+    if (budget.totalFunds < 515) break; // Reserve + road + wire
     var pos = pathOrLoc[i];
-    roadTool.doTool(pos.x, pos.y, this.blockMaps);
-    if (roadTool.result === roadTool.TOOLRESULT_OK) {
-      roadTool.modifyIfEnoughFunding(budget);
+    if (this._buildRoadWithWire(pos.x, pos.y)) {
       success = true;
-    } else {
-      roadTool.clear();
     }
   }
 
@@ -424,22 +513,7 @@ AIHelper.prototype._buildRoadConnection = function() {
 };
 
 
-AIHelper.prototype._placeRoadAt = function(x, y) {
-  var budget = this.simulation.budget;
-  if (budget.totalFunds < 510) return false;
-
-  var roadTool = this.tools.road;
-  roadTool.doTool(x, y, this.blockMaps);
-  if (roadTool.result === roadTool.TOOLRESULT_OK) {
-    roadTool.modifyIfEnoughFunding(budget);
-    return true;
-  }
-  roadTool.clear();
-  return false;
-};
-
-
-// Build full wire path (not just 1 tile)
+// Build wire connection (for unpowered zones)
 AIHelper.prototype._buildWireConnection = function() {
   var path = this.advisor.findWireToConnect();
   if (!path || path.length === 0) return false;
@@ -447,10 +521,10 @@ AIHelper.prototype._buildWireConnection = function() {
   var budget = this.simulation.budget;
   var wireTool = this.tools.wire;
   var success = false;
-  var maxWires = 20; // Cap per action
+  var maxWires = 20;
 
   for (var i = 0; i < Math.min(path.length, maxWires); i++) {
-    if (budget.totalFunds < 505) break; // Keep $500 reserve + $5 for wire
+    if (budget.totalFunds < 505) break;
 
     var pos = path[i];
     wireTool.doTool(pos.x, pos.y, this.blockMaps);
@@ -484,44 +558,20 @@ AIHelper.prototype._bulldozeRubble = function() {
 };
 
 
+// Ensure road+wire access for a zone
 AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
   if (this.advisor._hasNearbyRoad(x, y, size)) return;
 
   var budget = this.simulation.budget;
-  if (budget.totalFunds < 520) return; // Reserve check
+  if (budget.totalFunds < 520) return;
 
-  var roadTool = this.tools.road;
   var half = Math.floor(size / 2);
 
-  // Build a short road segment along the bottom edge
+  // Build a short road+wire segment along the bottom edge
   for (var rx = x - half; rx <= x + half; rx++) {
     var ry = y + half + 1;
-    if (ry < this.map.height && budget.totalFunds >= 510) {
-      roadTool.doTool(rx, ry, this.blockMaps);
-      roadTool.modifyIfEnoughFunding(budget);
-    }
-  }
-};
-
-
-AIHelper.prototype._ensurePowerAccess = function(x, y, size) {
-  if (this.advisor._hasNearbyPower(x, y, size + 2)) return;
-
-  var budget = this.simulation.budget;
-  if (budget.totalFunds < 505) return; // Reserve check
-
-  var wireTool = this.tools.wire;
-  var dirs = [[0, -1], [1, 0], [0, 1], [-1, 0]];
-  for (var i = 0; i < dirs.length; i++) {
-    var wx = x + dirs[i][0] * (Math.floor(size / 2) + 1);
-    var wy = y + dirs[i][1] * (Math.floor(size / 2) + 1);
-    if (wx >= 0 && wy >= 0 && wx < this.map.width && wy < this.map.height) {
-      wireTool.doTool(wx, wy, this.blockMaps);
-      if (wireTool.result === wireTool.TOOLRESULT_OK) {
-        wireTool.modifyIfEnoughFunding(budget);
-        return;
-      }
-      wireTool.clear();
+    if (ry < this.map.height && budget.totalFunds >= 515) {
+      this._buildRoadWithWire(rx, ry);
     }
   }
 };
@@ -529,7 +579,7 @@ AIHelper.prototype._ensurePowerAccess = function(x, y, size) {
 
 AIHelper.prototype._tryPlacePark = function() {
   var budget = this.simulation.budget;
-  if (budget.totalFunds < 1000) return; // Don't waste money on parks when low
+  if (budget.totalFunds < 1000) return;
 
   var map = this.map;
   var blockMaps = this.blockMaps;

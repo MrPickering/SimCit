@@ -1,18 +1,34 @@
-/* AI Advisor for SimCit
+/* AI Advisor for SimCit - Strategy Engine
  *
- * Analyzes the current city state and recommends optimal actions.
- * Understands the full scoring formula from evaluation.js, the valve
- * system from valves.js, traffic routing, unemployment, and budget
- * mechanics to make decisions that maximize city score.
+ * Grid-based city planner with zone districts:
+ *   - Residential: NORTH of main road (clean, low pollution)
+ *   - Commercial: Along main road (central, accessible)
+ *   - Industrial: SOUTH of main road (pollution contained)
+ *   - Power plant: South-east, near industrial
+ *
+ * Phased growth:
+ *   - Bootstrap: Build optimal starter city layout
+ *   - Early: Wait for positive cash flow, build sparingly
+ *   - Growth: Expand grid systematically following demand
+ *   - Metro: Optimize score, add special buildings
+ *
+ * Key mechanics:
+ *   - Score: power ratio, zone caps (0.85x), crime, tax, unemployment
+ *   - Revenue: floor(totalPop * landValueAvg / 120) * cityTax * FLevels
+ *   - Traffic: MAX_TRAFFIC_DISTANCE = 30 tiles residential to jobs
+ *   - Power: Propagates through CONDBIT tiles (wire, road+wire hybrids, zone tiles)
+ *   - Zone tiles have CONDBIT (BNCNBIT = BURNBIT | CONDBIT)
+ *   - Zone growth: road access + power + pollution < 128 for residential
+ *   - Unemployment: resPop / ((comPop + indPop) * 8) - 1
  */
 
 import * as TileValues from './tileValues.ts';
 import { TileUtils } from './tileUtils.js';
 
 var PRIORITIES = {
-  EMERGENCY: 120,     // Going broke, no power
+  EMERGENCY: 120,
   POWER: 100,
-  BUDGET_ADJUST: 95,  // Tax/funding changes (free actions)
+  BUDGET_ADJUST: 95,
   ROAD_CONNECT: 90,
   ZONE_DEMAND: 80,
   WIRE_CONNECT: 75,
@@ -23,17 +39,109 @@ var PRIORITIES = {
   PARKS: 20
 };
 
-// Minimum funds to keep in reserve (don't spend below this)
 var MIN_RESERVE = 500;
-// Don't build expensive things unless we have this much headroom
 var COMFORTABLE_FUNDS = 2000;
+var GRID_SPACING = 4;
+var DISTRICT_RADIUS = 6;
 
 function AIAdvisor(simulation, gameMap, blockMaps) {
   this.simulation = simulation;
   this.map = gameMap;
   this.blockMaps = blockMaps;
+
+  this._plan = {
+    initialized: false,
+    gridOriginX: 0,
+    gridOriginY: 0
+  };
 }
 
+
+// ---- City plan management ----
+
+AIAdvisor.prototype._getPhase = function() {
+  var pop = this.simulation._census.totalPop;
+  if (pop === 0) return 'bootstrap';
+  if (pop < 50) return 'early';
+  if (pop < 500) return 'growth';
+  return 'metro';
+};
+
+
+AIAdvisor.prototype.initCityPlan = function(gx, gy) {
+  this._plan.initialized = true;
+  this._plan.gridOriginX = gx;
+  this._plan.gridOriginY = gy;
+};
+
+
+AIAdvisor.prototype.findStarterLocation = function() {
+  var cx = this.map.cityCentreX;
+  var cy = this.map.cityCentreY;
+
+  // Need area for T-grid: 13 wide x 15 tall
+  // Layout: (gx-6, gy-3) to (gx+6, gy+11)
+  for (var r = 0; r < 40; r++) {
+    for (var dy = -r; dy <= r; dy++) {
+      for (var dx = -r; dx <= r; dx++) {
+        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+        var gx = cx + dx;
+        var gy = cy + dy;
+        if (this._isAreaClear(gx - 6, gy - 3, 13, 15)) {
+          return { x: gx, y: gy };
+        }
+      }
+    }
+  }
+
+  // Fallback: smaller area (plant placed separately)
+  for (var r = 0; r < 40; r++) {
+    for (var dy = -r; dy <= r; dy++) {
+      for (var dx = -r; dx <= r; dx++) {
+        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+        var gx = cx + dx;
+        var gy = cy + dy;
+        if (this._isAreaClear(gx - 6, gy - 3, 13, 12)) {
+          return { x: gx, y: gy };
+        }
+      }
+    }
+  }
+
+  return null;
+};
+
+
+AIAdvisor.prototype._isGridAligned = function(x, y) {
+  if (!this._plan.initialized) return false;
+  var relX = x - this._plan.gridOriginX;
+  var relY = y - this._plan.gridOriginY;
+  return (((relX % GRID_SPACING) + GRID_SPACING) % GRID_SPACING === 2) &&
+         (((relY % GRID_SPACING) + GRID_SPACING) % GRID_SPACING === 2);
+};
+
+
+// Auto-detect grid from existing city if plan wasn't initialized
+AIAdvisor.prototype._ensurePlanInitialized = function() {
+  if (this._plan.initialized) return;
+
+  // Try to detect grid origin from existing zones
+  var map = this.map;
+  for (var y = 2; y < map.height - 2; y++) {
+    for (var x = 2; x < map.width - 2; x++) {
+      var tile = map.getTile(x, y);
+      if (tile.isZone()) {
+        this._plan.initialized = true;
+        this._plan.gridOriginX = x;
+        this._plan.gridOriginY = y;
+        return;
+      }
+    }
+  }
+};
+
+
+// ---- Main analysis ----
 
 AIAdvisor.prototype.analyze = function() {
   var recommendations = [];
@@ -42,45 +150,30 @@ AIAdvisor.prototype.analyze = function() {
   var budget = sim.budget;
   var valves = sim._valves;
 
-  // Budget adjustments are FREE actions - always check first
+  this._ensurePlanInitialized();
+
+  // Budget adjustments are FREE - always check first
   var budgetActions = this._analyzeBudgetActions(budget, census);
   recommendations = recommendations.concat(budgetActions);
 
-  // Check if we're in emergency mode (very low funds)
+  // Emergency mode
   var isEmergency = budget.totalFunds < MIN_RESERVE && census.totalPop > 0;
-
   if (isEmergency) {
     recommendations.push({
       priority: PRIORITIES.EMERGENCY,
-      message: 'EMERGENCY: Funds at $' + budget.totalFunds + '. Halting construction until revenue recovers.'
+      message: 'EMERGENCY: Funds at $' + budget.totalFunds + '. Halting construction.'
     });
-    // In emergency, only return budget actions (free) - don't build anything
     recommendations.sort(function(a, b) { return b.priority - a.priority; });
     return recommendations;
   }
 
-  // Power
   recommendations = recommendations.concat(this._analyzePower(census, budget));
-
-  // Zone demand (with unemployment awareness)
   recommendations = recommendations.concat(this._analyzeZoneDemand(census, valves, budget));
-
-  // Infrastructure (roads, traffic)
   recommendations = recommendations.concat(this._analyzeInfrastructure(census, budget));
-
-  // Traffic
   recommendations = recommendations.concat(this._analyzeTraffic(census));
-
-  // Services (police, fire - using effect maps for coverage gaps)
   recommendations = recommendations.concat(this._analyzeServices(census, budget));
-
-  // Budget info (non-actionable advice)
   recommendations = recommendations.concat(this._analyzeBudgetInfo(budget, census));
-
-  // Special buildings (stadium, port, airport)
   recommendations = recommendations.concat(this._analyzeSpecialBuildings(census, budget));
-
-  // Disaster recovery
   recommendations = recommendations.concat(this._analyzeDisasterRecovery());
 
   recommendations.sort(function(a, b) { return b.priority - a.priority; });
@@ -102,7 +195,6 @@ AIAdvisor.prototype.getAdvice = function() {
 AIAdvisor.prototype.decideBestAction = function() {
   var recs = this.analyze();
   if (recs.length === 0) return null;
-
   for (var i = 0; i < recs.length; i++) {
     if (recs[i].action) return recs[i];
   }
@@ -110,19 +202,15 @@ AIAdvisor.prototype.decideBestAction = function() {
 };
 
 
-// ---- Budget actions (FREE - no spending required) ----
+// ---- Budget actions (FREE) ----
 
 AIAdvisor.prototype._analyzeBudgetActions = function(budget, census) {
   var recs = [];
 
-  // Optimal tax rate: 7% is the sweet spot (taxTable gives 0 penalty at index 7)
-  // Above 12 triggers complaints; game score directly penalised by cityTax amount
   var optimalTax = 7;
   if (budget.totalFunds < 1000 && census.totalPop > 0) {
-    // In financial trouble: raise to 9% temporarily
     optimalTax = 9;
   } else if (budget.totalFunds > 15000) {
-    // Flush with cash: lower to 6% to boost growth
     optimalTax = 6;
   }
 
@@ -134,11 +222,8 @@ AIAdvisor.prototype._analyzeBudgetActions = function(budget, census) {
     });
   }
 
-  // Ensure service funding is at 100% when we can afford it, reduce when we can't
   var totalMaintenance = budget.roadMaintenanceBudget + budget.fireMaintenanceBudget + budget.policeMaintenanceBudget;
   if (totalMaintenance > 0 && budget.totalFunds < totalMaintenance && census.totalPop > 0) {
-    // Can't afford full funding - prioritize roads > fire > police
-    // Roads deteriorate and hurt score; fire/police just reduce effectiveness
     var targetRoad = Math.min(1.0, budget.totalFunds / budget.roadMaintenanceBudget);
     var remaining = Math.max(0, budget.totalFunds - budget.roadMaintenanceBudget);
     var targetFire = budget.fireMaintenanceBudget > 0 ? Math.min(1.0, remaining / budget.fireMaintenanceBudget) : 1.0;
@@ -153,7 +238,6 @@ AIAdvisor.prototype._analyzeBudgetActions = function(budget, census) {
       });
     }
   } else if (budget.roadPercent < 1 || budget.firePercent < 1 || budget.policePercent < 1) {
-    // We can afford full funding but it's not set
     if (budget.totalFunds > totalMaintenance * 2) {
       recs.push({
         priority: PRIORITIES.BUDGET_ADJUST - 1,
@@ -184,11 +268,10 @@ AIAdvisor.prototype._analyzePower = function(census, budget) {
     } else {
       recs.push({
         priority: PRIORITIES.POWER + 10,
-        message: 'CRITICAL: No power! Saving for a coal plant ($3000). Have: $' + budget.totalFunds
+        message: 'CRITICAL: No power! Saving for coal plant ($3000). Have: $' + budget.totalFunds
       });
     }
   } else if (totalZones > 0 && census.unpoweredZoneCount > totalZones * 0.3) {
-    // Score penalty: score *= (poweredZones / totalZones) - this is huge
     if (budget.totalFunds >= 5000 + COMFORTABLE_FUNDS) {
       recs.push({
         priority: PRIORITIES.POWER + 5,
@@ -219,24 +302,33 @@ AIAdvisor.prototype._analyzePower = function(census, budget) {
 };
 
 
-// ---- Zone demand (with unemployment awareness) ----
+// ---- Zone demand (phase-aware) ----
 
 AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   var recs = [];
   var totalZonePop = census.resZonePop + census.comZonePop + census.indZonePop;
+  var phase = this._getPhase();
 
-  // Early game: build starter city
-  if (totalZonePop === 0 && budget.totalFunds >= 1000) {
+  // Bootstrap: build starter city
+  if (totalZonePop === 0 && budget.totalFunds >= 4000) {
     recs.push({
       priority: PRIORITIES.ZONE_DEMAND + 15,
-      message: 'Start your city! Placing residential, commercial, industrial with roads and power.',
+      message: 'Building optimal starter city with grid layout and power.',
       action: { type: 'build_starter' }
     });
     return recs;
   }
 
-  // Calculate unemployment: key factor the evaluation uses
-  // unemployment = (resPop / ((comPop + indPop) * 8)) - 1, clamped 0-255
+  // Early phase: don't build until cash flow is positive
+  if (phase === 'early' && budget.cashFlow < 0) {
+    recs.push({
+      priority: PRIORITIES.BUDGET_INFO,
+      message: 'Early phase: waiting for positive cash flow ($' + budget.cashFlow + '/yr) before expanding.'
+    });
+    return recs;
+  }
+
+  // Calculate unemployment
   var jobBase = (census.comPop + census.indPop) * 8;
   var unemployment = 0;
   if (jobBase > 0) {
@@ -244,20 +336,23 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
     unemployment = Math.max(0, Math.min(unemployment, 255));
   }
 
-  // Don't build if we can't afford it plus maintain reserves
-  var canAffordZone = budget.totalFunds >= 100 + MIN_RESERVE;
+  // Phase-dependent reserve
+  var buildReserve = phase === 'early' ? 5000 :
+                     phase === 'growth' ? COMFORTABLE_FUNDS :
+                     phase === 'metro' ? 5000 : MIN_RESERVE;
+  var canAffordZone = budget.totalFunds >= 200 + buildReserve;
 
   if (!canAffordZone) {
     if (valves.resValve > 500 || valves.comValve > 500 || valves.indValve > 500) {
       recs.push({
         priority: PRIORITIES.ZONE_DEMAND - 5,
-        message: 'Demand exists but funds too low ($' + budget.totalFunds + '). Waiting for tax revenue.'
+        message: 'Demand exists but keeping reserve ($' + budget.totalFunds + '). Waiting for revenue.'
       });
     }
     return recs;
   }
 
-  // If unemployment is high, prioritize jobs (commercial/industrial) over residential
+  // High unemployment: prioritize jobs
   if (unemployment > 100 && (valves.comValve > 0 || valves.indValve > 0)) {
     recs.push({
       priority: PRIORITIES.ZONE_DEMAND + 12,
@@ -267,7 +362,7 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
     return recs;
   }
 
-  // Follow RCI demand valves - they encode the simulation's own growth model
+  // Follow RCI demand valves
   if (valves.resValve > 100) {
     var urgency = Math.min(valves.resValve / 2000 * 20, 20);
     recs.push({
@@ -295,7 +390,7 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
     });
   }
 
-  // Oversupply warnings - score penalty at -1000 (0.85x per type)
+  // Oversupply warnings
   if (valves.resValve < -1000) {
     recs.push({ priority: PRIORITIES.BUDGET_INFO - 5,
       message: 'Residential oversupply (score -15%). Need more jobs.' });
@@ -319,7 +414,6 @@ AIAdvisor.prototype._analyzeInfrastructure = function(census, budget) {
   var recs = [];
   var totalZonePop = census.resZonePop + census.comZonePop + census.indZonePop;
 
-  // Game sends NEED_MORE_ROADS when totalZonePop > 10 && totalZonePop * 2 > roadTotal
   if (totalZonePop > 10 && totalZonePop * 2 > census.roadTotal && budget.totalFunds >= 10 + MIN_RESERVE) {
     recs.push({
       priority: PRIORITIES.ROAD_CONNECT,
@@ -328,7 +422,6 @@ AIAdvisor.prototype._analyzeInfrastructure = function(census, budget) {
     });
   }
 
-  // Road deterioration: score -= MAX_ROAD_EFFECT - roadEffect
   if (budget.roadEffect < Math.floor(5 * budget.MAX_ROAD_EFFECT / 8) && census.roadTotal > 30) {
     recs.push({
       priority: PRIORITIES.BUDGET_ADJUST,
@@ -341,17 +434,16 @@ AIAdvisor.prototype._analyzeInfrastructure = function(census, budget) {
 };
 
 
-// ---- Traffic analysis (NEW) ----
+// ---- Traffic ----
 
 AIAdvisor.prototype._analyzeTraffic = function(census) {
   var recs = [];
-
-  // Game warns at trafficAverage > 60
   var trafficAvg = census.trafficAverage || 0;
+
   if (trafficAvg > 60) {
     recs.push({
       priority: PRIORITIES.TRAFFIC + 5,
-      message: 'Traffic congestion (avg ' + Math.round(trafficAvg) + '). Build parallel roads to ease bottlenecks.',
+      message: 'Traffic congestion (avg ' + Math.round(trafficAvg) + '). Building parallel roads.',
       action: { type: 'build_roads' }
     });
   }
@@ -367,7 +459,6 @@ AIAdvisor.prototype._analyzeServices = function(census, budget) {
   var totalPop = census.totalPop;
   var canAfford = budget.totalFunds >= 500 + COMFORTABLE_FUNDS;
 
-  // Game sends NEED_POLICE_STATION at totalPop > 60 && policeStationPop === 0
   if (totalPop > 60 && census.policeStationPop === 0 && canAfford) {
     recs.push({
       priority: PRIORITIES.SERVICES + 10,
@@ -376,25 +467,22 @@ AIAdvisor.prototype._analyzeServices = function(census, budget) {
     });
   }
 
-  // Game sends NEED_FIRE_STATION at totalPop > 60 && fireStationPop === 0
   if (totalPop > 60 && census.fireStationPop === 0 && canAfford) {
     recs.push({
       priority: PRIORITIES.SERVICES + 10,
-      message: 'No fire dept! Fires will spread. Building station ($500).',
+      message: 'No fire dept! Building station ($500).',
       action: { type: 'build', tool: 'fire' }
     });
   }
 
-  // Crime > 100 triggers game warning - add more police using coverage gap detection
   if (census.crimeAverage > 100 && canAfford) {
     recs.push({
       priority: PRIORITIES.SERVICES + 5,
-      message: 'Crime high (avg ' + census.crimeAverage + '). Building police station in worst area.',
+      message: 'Crime high (avg ' + census.crimeAverage + '). Building police station.',
       action: { type: 'build', tool: 'police' }
     });
   }
 
-  // Active fires
   if (census.firePop > 0 && census.fireStationPop === 0 && canAfford) {
     recs.push({
       priority: PRIORITIES.SERVICES + 8,
@@ -407,7 +495,7 @@ AIAdvisor.prototype._analyzeServices = function(census, budget) {
 };
 
 
-// ---- Budget info (non-actionable) ----
+// ---- Budget info ----
 
 AIAdvisor.prototype._analyzeBudgetInfo = function(budget, census) {
   var recs = [];
@@ -420,7 +508,7 @@ AIAdvisor.prototype._analyzeBudgetInfo = function(budget, census) {
   } else if (budget.totalFunds < COMFORTABLE_FUNDS && census.totalPop > 0) {
     recs.push({
       priority: PRIORITIES.BUDGET_INFO + 5,
-      message: 'Low funds ($' + budget.totalFunds + '). Building only essential infrastructure.'
+      message: 'Low funds ($' + budget.totalFunds + '). Building only essentials.'
     });
   }
 
@@ -440,8 +528,6 @@ AIAdvisor.prototype._analyzeBudgetInfo = function(budget, census) {
 AIAdvisor.prototype._analyzeSpecialBuildings = function(census, budget) {
   var recs = [];
 
-  // These thresholds match exactly what simulation.js uses to set resCap/comCap/indCap
-  // When capped, score gets 0.85x penalty per capped type
   if (census.resPop > 500 && census.stadiumPop === 0 && budget.totalFunds >= 5000 + COMFORTABLE_FUNDS) {
     recs.push({
       priority: PRIORITIES.SPECIAL_BUILDINGS + 5,
@@ -470,21 +556,16 @@ AIAdvisor.prototype._analyzeSpecialBuildings = function(census, budget) {
 };
 
 
-// ---- Disaster recovery (NEW) ----
+// ---- Disaster recovery ----
 
 AIAdvisor.prototype._analyzeDisasterRecovery = function() {
   var recs = [];
   var map = this.map;
-  var width = map.width;
-  var height = map.height;
-
-  // Scan for fire/rubble/flood and count damaged tiles
   var fireCount = 0;
   var rubbleCount = 0;
 
-  // Sample every 4th tile for performance
-  for (var y = 0; y < height; y += 4) {
-    for (var x = 0; x < width; x += 4) {
+  for (var y = 0; y < map.height; y += 4) {
+    for (var x = 0; x < map.width; x += 4) {
       var tv = map.getTileValue(x, y);
       if (tv >= TileValues.FIRE && tv <= TileValues.LASTFIRE) fireCount++;
       if (tv >= TileValues.RUBBLE && tv <= TileValues.LASTRUBBLE) rubbleCount++;
@@ -494,7 +575,7 @@ AIAdvisor.prototype._analyzeDisasterRecovery = function() {
   if (fireCount > 3) {
     recs.push({
       priority: PRIORITIES.EMERGENCY - 5,
-      message: 'Fires burning! ' + (fireCount * 16) + '+ tiles affected. Fire stations needed.',
+      message: 'Fires burning! ' + (fireCount * 16) + '+ tiles affected.',
       action: { type: 'build', tool: 'fire' }
     });
   }
@@ -502,7 +583,7 @@ AIAdvisor.prototype._analyzeDisasterRecovery = function() {
   if (rubbleCount > 5) {
     recs.push({
       priority: PRIORITIES.TRAFFIC,
-      message: 'Disaster rubble detected (' + (rubbleCount * 16) + '+ tiles). Rebuilding needed.',
+      message: 'Disaster rubble (' + (rubbleCount * 16) + '+ tiles). Rebuilding.',
       action: { type: 'bulldoze_rubble' }
     });
   }
@@ -511,19 +592,15 @@ AIAdvisor.prototype._analyzeDisasterRecovery = function() {
 };
 
 
-// ---- Location finding functions ----
+// ---- Location finding ----
 
-// Find best location for a 3x3 zone
 AIAdvisor.prototype.findBestZoneLocation = function(toolName) {
   var map = this.map;
-  var blockMaps = this.blockMaps;
   var bestScore = -Infinity;
   var bestX = -1, bestY = -1;
-  var width = map.width;
-  var height = map.height;
 
-  for (var y = 2; y < height - 2; y += 2) {
-    for (var x = 2; x < width - 2; x += 2) {
+  for (var y = 2; y < map.height - 2; y += 2) {
+    for (var x = 2; x < map.width - 2; x += 2) {
       if (!this._isAreaClear(x - 1, y - 1, 3)) continue;
 
       var score = this._scoreZoneLocation(x, y, toolName);
@@ -540,16 +617,13 @@ AIAdvisor.prototype.findBestZoneLocation = function(toolName) {
 };
 
 
-// Find best location for a 4x4 building
 AIAdvisor.prototype.findBestLargeLocation = function(toolName) {
   var map = this.map;
   var bestScore = -Infinity;
   var bestX = -1, bestY = -1;
-  var width = map.width;
-  var height = map.height;
 
-  for (var y = 2; y < height - 3; y += 3) {
-    for (var x = 2; x < width - 3; x += 3) {
+  for (var y = 2; y < map.height - 3; y += 3) {
+    for (var x = 2; x < map.width - 3; x += 3) {
       if (!this._isAreaClear(x - 1, y - 1, 4)) continue;
 
       var score = this._scoreLargeLocation(x, y, toolName);
@@ -566,16 +640,13 @@ AIAdvisor.prototype.findBestLargeLocation = function(toolName) {
 };
 
 
-// Find best location for a 6x6 building (airport)
 AIAdvisor.prototype.findBestAirportLocation = function() {
   var map = this.map;
   var bestScore = -Infinity;
   var bestX = -1, bestY = -1;
-  var width = map.width;
-  var height = map.height;
 
-  for (var y = 4; y < height - 4; y += 4) {
-    for (var x = 4; x < width - 4; x += 4) {
+  for (var y = 4; y < map.height - 4; y += 4) {
+    for (var x = 4; x < map.width - 4; x += 4) {
       if (!this._isAreaClear(x - 1, y - 1, 6)) continue;
 
       var score = this._scoreLargeLocation(x, y, 'airport');
@@ -592,7 +663,6 @@ AIAdvisor.prototype.findBestAirportLocation = function() {
 };
 
 
-// Build a full road path between two points, returning an array of positions
 AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
   var path = [];
   var cx = fromX;
@@ -607,7 +677,6 @@ AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
     var dy = toY - cy;
     var nx, ny;
 
-    // Prefer the longer axis
     if (Math.abs(dx) >= Math.abs(dy)) {
       nx = cx + (dx > 0 ? 1 : -1);
       ny = cy;
@@ -616,7 +685,6 @@ AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
       ny = cy + (dy > 0 ? 1 : -1);
     }
 
-    // Check if the target tile is buildable
     if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
       var tv = map.getTileValue(nx, ny);
       if (tv === TileValues.DIRT || TileUtils.canBulldoze(tv) || TileUtils.isRoad(tv)) {
@@ -629,7 +697,6 @@ AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
       }
     }
 
-    // Obstacle - try the other axis
     if (Math.abs(dx) >= Math.abs(dy)) {
       nx = cx;
       ny = cy + (dy !== 0 ? (dy > 0 ? 1 : -1) : 1);
@@ -650,14 +717,13 @@ AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
       }
     }
 
-    break; // Stuck
+    break;
   }
 
   return path;
 };
 
 
-// Find zones needing roads and return the full path to connect them
 AIAdvisor.prototype.findRoadToConnect = function() {
   var map = this.map;
   var width = map.width;
@@ -671,12 +737,10 @@ AIAdvisor.prototype.findRoadToConnect = function() {
 
       var roadTarget = this._findNearestRoad(x, y);
       if (roadTarget) {
-        // Return the full path
         var path = this.findRoadPath(x, y, roadTarget.x, roadTarget.y);
         if (path.length > 0) return path;
       }
 
-      // No existing road found - build one adjacent to the zone
       var dirs = [[0, -2], [2, 0], [0, 2], [-2, 0]];
       for (var d = 0; d < dirs.length; d++) {
         var rx = x + dirs[d][0];
@@ -695,7 +759,7 @@ AIAdvisor.prototype.findRoadToConnect = function() {
 };
 
 
-// Find wire path to connect unpowered zones
+// Find wire path to connect unpowered zones - routes along roads
 AIAdvisor.prototype.findWireToConnect = function() {
   var map = this.map;
   var width = map.width;
@@ -707,11 +771,17 @@ AIAdvisor.prototype.findWireToConnect = function() {
       if (!tile.isZone()) continue;
       if (tile.isPowered()) continue;
 
+      // Find nearest powered tile (prefer powered roads for wire routing)
       var powerSource = this._findNearestPowered(x, y);
-      if (powerSource) {
-        var path = this.findRoadPath(x, y, powerSource.x, powerSource.y);
-        if (path.length > 0) return path;
-      }
+      if (!powerSource) continue;
+
+      // Build wire path, preferring to follow roads
+      var path = this._findWirePath(x, y, powerSource.x, powerSource.y);
+      if (path.length > 0) return path;
+
+      // Fallback: direct path
+      var directPath = this.findRoadPath(x, y, powerSource.x, powerSource.y);
+      if (directPath.length > 0) return directPath;
     }
   }
 
@@ -719,7 +789,63 @@ AIAdvisor.prototype.findWireToConnect = function() {
 };
 
 
-// Find rubble tiles to bulldoze (disaster recovery)
+// Wire path that follows roads (converts to road+wire hybrids)
+AIAdvisor.prototype._findWirePath = function(fromX, fromY, toX, toY) {
+  var path = [];
+  var cx = fromX;
+  var cy = fromY;
+  var map = this.map;
+  var maxSteps = Math.abs(toX - fromX) + Math.abs(toY - fromY) + 10;
+
+  for (var step = 0; step < maxSteps; step++) {
+    if (cx === toX && cy === toY) break;
+
+    var dx = toX - cx;
+    var dy = toY - cy;
+
+    // Try all 4 directions, prioritizing: toward target + road tiles
+    var candidates = [];
+    var dirs = [[0, -1], [1, 0], [0, 1], [-1, 0]];
+    for (var i = 0; i < dirs.length; i++) {
+      var nx = cx + dirs[i][0];
+      var ny = cy + dirs[i][1];
+      if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
+
+      var tv = map.getTileValue(nx, ny);
+      var tile = map.getTile(nx, ny);
+      var isRoad = TileUtils.isRoad(tv);
+      var isClear = tv === TileValues.DIRT || TileUtils.canBulldoze(tv);
+      var isConductive = tile.isConductive();
+
+      if (!isRoad && !isClear && !isConductive) continue;
+
+      // Score: prefer roads, prefer direction toward target
+      var score = 0;
+      if (isRoad) score += 100; // Strongly prefer wiring roads
+      if (isConductive) score += 50; // Already powered path
+      score -= Math.abs(nx - toX) + Math.abs(ny - toY); // Closer to target
+
+      candidates.push({ x: nx, y: ny, score: score, isRoad: isRoad, needsWire: isRoad && !isConductive });
+    }
+
+    if (candidates.length === 0) break;
+
+    candidates.sort(function(a, b) { return b.score - a.score; });
+    var best = candidates[0];
+
+    // Only add to path if it needs a wire placed
+    if (best.needsWire || (!TileUtils.isRoad(map.getTileValue(best.x, best.y)) && !map.getTile(best.x, best.y).isConductive())) {
+      path.push({ x: best.x, y: best.y });
+    }
+
+    cx = best.x;
+    cy = best.y;
+  }
+
+  return path;
+};
+
+
 AIAdvisor.prototype.findRubbleToClear = function() {
   var map = this.map;
   for (var y = 0; y < map.height; y += 2) {
@@ -734,7 +860,6 @@ AIAdvisor.prototype.findRubbleToClear = function() {
 };
 
 
-// Find areas with high traffic density for road expansion
 AIAdvisor.prototype.findTrafficBottleneck = function() {
   var blockMaps = this.blockMaps;
   var map = this.map;
@@ -746,7 +871,6 @@ AIAdvisor.prototype.findTrafficBottleneck = function() {
     for (var y = 0; y < tdMap.gameMapHeight; y += tdMap.blockSize * 2) {
       var traffic = tdMap.worldGet(x, y);
       if (traffic > bestTraffic) {
-        // Check if we can build a parallel road nearby
         for (var dy = -2; dy <= 2; dy++) {
           for (var dx = -2; dx <= 2; dx++) {
             var nx = x + dx;
@@ -769,24 +893,25 @@ AIAdvisor.prototype.findTrafficBottleneck = function() {
 };
 
 
-// ---- Scoring functions ----
+// ---- Scoring (strict district enforcement + clustering) ----
 
 AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   var score = 0;
   var blockMaps = this.blockMaps;
 
   // Road adjacency is critical - zones without road access won't grow
-  // (residential.js findPerimeterRoad checks 12 perimeter tiles for driveable)
   if (this._hasNearbyRoad(x, y, 2)) score += 150;
   else if (this._hasNearbyRoad(x, y, 4)) score += 60;
   else if (this._hasNearbyRoad(x, y, 8)) score += 10;
-  else return -1000; // Don't place zones with no road access at all
+  else return -9999;
 
   // Power connectivity
   if (this._hasNearbyPower(x, y, 4)) score += 50;
   else if (this._hasNearbyPower(x, y, 8)) score += 20;
 
-  // Block map values
+  // Grid alignment bonus
+  if (this._isGridAligned(x, y)) score += 40;
+
   var landValue = this._safeBlockGet(blockMaps.landValueMap, x, y);
   var pollution = this._safeBlockGet(blockMaps.pollutionDensityMap, x, y);
   var crime = this._safeBlockGet(blockMaps.crimeRateMap, x, y);
@@ -795,61 +920,62 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
 
   switch (toolName) {
     case 'residential':
-      // residential.js: pollution > 128 causes zone to DEGRADE. Critical threshold.
-      if (pollution > 128) return -500;
+      // HARD REJECT: pollution kills residential (degrades at > 128)
+      if (pollution > 100) return -9999;
+      // HARD REJECT: industrial within district radius = pollution source
+      if (this._hasNearbyIndustrial(x, y, DISTRICT_RADIUS)) return -9999;
       score += landValue * 2;
-      score -= pollution * 3;
+      score -= pollution * 4;
       score -= crime * 2;
-      score -= traffic; // High traffic is bad for residential
-      // Keep away from industrial (pollution source)
-      if (this._hasNearbyIndustrial(x, y, 4)) score -= 40;
-      // But needs to be within traffic routing distance (MAX_TRAFFIC_DISTANCE = 30)
-      // of commercial/industrial for employment
-      if (this._hasNearbyCommercial(x, y, 15) || this._hasNearbyIndustrial(x, y, 15)) score += 25;
+      score -= traffic;
+      // Cluster bonus: residential near residential
+      if (this._hasNearbyResidential(x, y, 6)) score += 80;
+      // Needs jobs within traffic routing distance
+      if (this._hasNearbyCommercial(x, y, 15) || this._hasNearbyIndustrial(x, y, 20)) score += 25;
       break;
 
     case 'commercial':
+      if (pollution > 128) return -9999;
       score += landValue * 3;
       score -= pollution * 2;
-      // Commercial needs residential nearby (labor supply)
-      if (this._hasNearbyResidential(x, y, 10)) score += 40;
-      else score -= 30;
-      // Moderate traffic is OK for commercial
+      // Needs residential nearby (labor)
+      if (this._hasNearbyResidential(x, y, 10)) score += 50;
+      else score -= 40;
+      // Cluster bonus
+      if (this._hasNearbyCommercial(x, y, 6)) score += 60;
       break;
 
     case 'industrial':
-      // Industrial doesn't care about pollution; prefers low land value
+      // HARD REJECT: keep away from residential
+      if (this._hasNearbyResidential(x, y, DISTRICT_RADIUS)) return -9999;
       score -= landValue;
-      score += 20;
-      // Keep away from residential
-      if (!this._hasNearbyResidential(x, y, 5)) score += 30;
-      // But needs to be reachable from residential
-      if (this._hasNearbyResidential(x, y, 20)) score += 15;
+      score += 30;
+      // Cluster bonus: industrial near industrial
+      if (this._hasNearbyIndustrial(x, y, 6)) score += 80;
+      // But must be reachable from residential for traffic routing
+      if (this._hasNearbyResidential(x, y, 25)) score += 20;
       break;
 
     case 'police':
-      // Use policeStationEffectMap to find coverage gaps
       var policeEffect = this._safeBlockGet(blockMaps.policeStationEffectMap, x, y);
-      score += (1000 - policeEffect); // High score where coverage is LOW
+      score += (1000 - policeEffect);
       score += crime * 2;
       score += popDensity;
       if (this._hasNearbyBuilding(x, y, TileValues.POLICESTATION, 15)) score -= 300;
       break;
 
     case 'fire':
-      // Use fireStationEffectMap to find coverage gaps
       var fireEffect = this._safeBlockGet(blockMaps.fireStationEffectMap, x, y);
-      score += (1000 - fireEffect); // High score where coverage is LOW
+      score += (1000 - fireEffect);
       score += popDensity * 2;
       if (this._hasNearbyBuilding(x, y, TileValues.FIRESTATION, 15)) score -= 300;
       break;
   }
 
-  // Prefer closer to city center to reduce sprawl and road costs
+  // Prefer closer to city center
   var dx = x - this.map.cityCentreX;
   var dy = y - this.map.cityCentreY;
-  var dist = Math.sqrt(dx * dx + dy * dy);
-  score -= dist * 0.3;
+  score -= Math.sqrt(dx * dx + dy * dy) * 0.3;
 
   return score;
 };
@@ -870,7 +996,10 @@ AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
   switch (toolName) {
     case 'coal':
     case 'nuclear':
+      // Keep away from residential (pollution source)
       if (!this._hasNearbyResidential(x, y, 8)) score += 50;
+      // Prefer near industrial
+      if (this._hasNearbyIndustrial(x, y, 10)) score += 30;
       score -= landValue;
       break;
 
@@ -887,7 +1016,6 @@ AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
 
     case 'airport':
       score -= landValue;
-      // Airports need open space
       break;
   }
 
@@ -897,13 +1025,15 @@ AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
 
 // ---- Map scanning utilities ----
 
-AIAdvisor.prototype._isAreaClear = function(startX, startY, size) {
+AIAdvisor.prototype._isAreaClear = function(startX, startY, width, height) {
+  if (height === undefined) height = width;
   var map = this.map;
-  if (startX < 0 || startY < 0 || startX + size > map.width || startY + size > map.height)
+
+  if (startX < 0 || startY < 0 || startX + width > map.width || startY + height > map.height)
     return false;
 
-  for (var dy = 0; dy < size; dy++) {
-    for (var dx = 0; dx < size; dx++) {
+  for (var dy = 0; dy < height; dy++) {
+    for (var dx = 0; dx < width; dx++) {
       var tileValue = map.getTileValue(startX + dx, startY + dy);
       if (tileValue !== TileValues.DIRT && !TileUtils.canBulldoze(tileValue))
         return false;
