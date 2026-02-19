@@ -95,6 +95,43 @@ var R_LEVELS = [0.7, 0.9, 1.2];
 // External market competition multipliers from valves.js
 var EXT_MARKET_PARAM_TABLE = [1.2, 1.1, 0.98];
 
+// ---- Proactive environmental model constants ----
+// From blockMapUtils.js getPollutionValue(): exact pollution emissions per tile type
+var POLLUTION_INDUSTRIAL = 50;  // Industrial zones (POWERBASE to PORTBASE)
+var POLLUTION_COAL_PLANT = 100; // Coal power plants (to LASTPOWERPLANT)
+var POLLUTION_HEAVY_TRAFFIC = 75; // Heavy traffic roads (HTRFBASE+)
+var POLLUTION_LOW_TRAFFIC = 50;   // Low traffic roads (LTRFBASE to HTRFBASE)
+var POLLUTION_FIRE = 90;         // Active fires
+var POLLUTION_RADIATION = 255;   // Nuclear meltdown radiation
+
+// From blockMapUtils.js: pollution map uses 2-pass smoothing with block size 2.
+// Each smoothing pass: avg = (center + N + S + E + W) >> 2
+// After 2 passes, pollution at distance d from source ≈ source * 0.25^(d/2)
+// This means: industrial (50) at distance 4 → ~3 pollution, safe for residential.
+// Coal (100) at distance 6 → ~6 pollution, safe. Distance 2 → ~25, concerning.
+var SAFE_RESIDENTIAL_POLLUTION = 80;  // Hard block at 128, safety margin
+var MIN_INDUSTRY_RESIDENTIAL_GAP = 6; // Tiles between industry and residential
+
+// From blockMapUtils.js: crime = (128 - landValue) + populationDensity - policeEffect
+// Crime > 190 → additional -20 land value penalty (vicious cycle)
+var CRIME_THRESHOLD_SEVERE = 190;
+var CRIME_THRESHOLD_BUILD_POLICE = 80;
+
+// From traffic.js: MAX_TRAFFIC_DISTANCE = 30
+// Zones MUST have complementary zones within 30 tiles or traffic check fails → degradation
+var MAX_TRAFFIC_DISTANCE = 30;
+
+// From commercial.js: commercial growth capped by population > (landValue >> 5)
+// landValue 0-31 → cap at 0 (can't grow), 32-63 → cap at 1, 64-95 → cap 2, etc.
+// Commercial zones need landValue ≥ 160 to reach max population 5
+var COMMERCIAL_LV_FOR_MAX_POP = 160;
+
+// From blockMapUtils.js: landValue = (34 - cityCentreDistance/2) * 4 + terrain - pollution
+// Parks add to terrainDensityMap (15 points per undeveloped tile in 4x4 block)
+// At city center (dist=0): base landValue = 136, at dist=20: base = 96
+var LAND_VALUE_CENTER_BASE = 136;
+var LAND_VALUE_PER_DISTANCE = 2; // Lose 2 landValue per tile from center
+
 function AIAdvisor(simulation, gameMap, blockMaps) {
   this.simulation = simulation;
   this.map = gameMap;
@@ -601,6 +638,275 @@ AIAdvisor.prototype._predictFundDepletion = function() {
     revenue: revenue,
     maintenance: totalMaint
   };
+};
+
+
+// ---- Proactive environmental prediction ----
+//
+// These methods let the AI PREDICT consequences BEFORE acting, not just react.
+// The AI should know from tile #1 that placing industrial near residential
+// will cause pollution that blocks growth. It should know that commercial
+// zones in low-landvalue areas will never reach max population.
+//
+// Key insight: some penalties are ACCEPTABLE trade-offs for faster growth.
+// The AI computes cost/benefit to decide when to accept vs avoid a penalty.
+
+// Predict pollution at a given location from all nearby sources.
+// Uses the EXACT emission values from blockMapUtils.js getPollutionValue()
+// and approximates 2-pass smoothing dispersion.
+//
+// After 2 passes of SMOOTH_ALL_THEN_CLAMP:
+//   pollution(dist) ≈ source_value × decay^dist
+//   where decay ≈ 0.4 per tile for 2-pass smoothing on blockSize=2 map
+//
+// This is an ESTIMATE — actual smoothing is more complex (5-point stencil)
+// but this approximation catches the big problems.
+AIAdvisor.prototype._predictPollutionAt = function(x, y) {
+  var map = this.map;
+  var totalPollution = 0;
+  var scanRadius = 12; // Beyond this, pollution contribution is negligible
+
+  for (var dy = -scanRadius; dy <= scanRadius; dy++) {
+    for (var dx = -scanRadius; dx <= scanRadius; dx++) {
+      var nx = x + dx;
+      var ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
+
+      var tv = map.getTileValue(nx, ny);
+      var emission = 0;
+
+      // Check tile type pollution emissions (from blockMapUtils.js:43-68)
+      if (TileUtils.isIndustrial(tv)) {
+        emission = POLLUTION_INDUSTRIAL;
+      } else if (tv >= TileValues.POWERBASE && tv <= TileValues.LASTPOWERPLANT) {
+        emission = POLLUTION_COAL_PLANT;
+      } else if (tv === TileValues.RADTILE) {
+        emission = POLLUTION_RADIATION;
+      }
+      // Skip traffic pollution — it's transient and hard to predict statically
+
+      if (emission === 0) continue;
+
+      // Approximate dispersion after 2-pass smoothing
+      var dist = Math.abs(dx) + Math.abs(dy); // Manhattan distance
+      // Each smoothing pass roughly halves the value per 2 tiles
+      // After 2 passes: roughly emission × 0.6^dist (empirical fit)
+      var dispersed = emission * Math.pow(0.6, dist);
+      totalPollution += dispersed;
+    }
+  }
+
+  return Math.round(Math.min(totalPollution, 255));
+};
+
+
+// Predict what land value WOULD be at a location, using the EXACT formula
+// from blockMapUtils.js:244-260:
+//   landValue = (34 - cityCentreDistance/2) * 4 + terrain - pollution
+//   if crime > 190: landValue -= 20
+//
+// This lets the AI choose placement spots that maximize land value → revenue.
+AIAdvisor.prototype._predictLandValueAt = function(x, y) {
+  var map = this.map;
+  var blockMaps = this.blockMaps;
+
+  // City centre distance component
+  var cdx = Math.abs(x - map.cityCentreX);
+  var cdy = Math.abs(y - map.cityCentreY);
+  var dist = Math.min(cdx + cdy, 64); // Clamped to 64
+  var distComponent = (34 - Math.floor(dist / 2)) * 4; // Range 8-136
+
+  // Terrain density (from terrainDensityMap, block size 4)
+  var terrain = this._safeBlockGet(blockMaps.terrainDensityMap, x, y);
+
+  // Pollution (use predicted if no blockMap data yet, or current data)
+  var pollution = this._safeBlockGet(blockMaps.pollutionDensityMap, x, y);
+
+  // Crime penalty
+  var crime = this._safeBlockGet(blockMaps.crimeRateMap, x, y);
+  var crimePenalty = crime > CRIME_THRESHOLD_SEVERE ? 20 : 0;
+
+  var lv = distComponent + terrain - pollution - crimePenalty;
+  return Math.max(1, Math.min(lv, 250));
+};
+
+
+// Check if placing a zone at (x,y) would cause traffic routing problems.
+// From traffic.js: each zone type routes to its complement within 30 tiles:
+//   Residential → Commercial (for shopping)
+//   Commercial → Industrial (for goods)
+//   Industrial → Residential (for workers)
+//
+// Returns true if the placement is safe (complement zone reachable).
+AIAdvisor.prototype._hasTrafficRouteTarget = function(x, y, zoneType) {
+  var targetCheck;
+  var searchRadius = MAX_TRAFFIC_DISTANCE;
+
+  switch (zoneType) {
+    case 'residential':
+      // Residential routes to commercial
+      targetCheck = function(tv) { return TileUtils.isCommercial(tv); };
+      break;
+    case 'commercial':
+      // Commercial routes to industrial
+      targetCheck = function(tv) { return TileUtils.isIndustrial(tv); };
+      break;
+    case 'industrial':
+      // Industrial routes to residential
+      targetCheck = function(tv) { return TileUtils.isResidential(tv); };
+      break;
+    default:
+      return true;
+  }
+
+  // Search within MAX_TRAFFIC_DISTANCE for target zone type
+  var map = this.map;
+  for (var dy = -searchRadius; dy <= searchRadius; dy++) {
+    for (var dx = -searchRadius; dx <= searchRadius; dx++) {
+      if (Math.abs(dx) + Math.abs(dy) > searchRadius) continue;
+      var nx = x + dx;
+      var ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
+      if (targetCheck(map.getTileValue(nx, ny))) return true;
+    }
+  }
+  return false;
+};
+
+
+// Compute the maximum commercial population a zone can reach at a location.
+// From commercial.js:48: `if (population > landValue) return;`
+// where landValue = blockMaps.landValueMap.worldGet(x,y) >> 5
+// So max commercial pop = floor(landValue / 32), capped at 5.
+//
+// This tells the AI: don't place commercial where landValue < 32 (waste of
+// money), and prefer landValue ≥ 160 for max growth potential.
+AIAdvisor.prototype._maxCommercialPopAt = function(x, y) {
+  var lv = this._safeBlockGet(this.blockMaps.landValueMap, x, y);
+  // Use predicted value if blockMap is empty (early game)
+  if (lv === 0) lv = this._predictLandValueAt(x, y);
+  return Math.min(lv >> 5, 5);
+};
+
+
+// Compute whether a penalty is an acceptable trade-off for growth speed.
+// The AI deliberately accepts some penalties when the growth benefit outweighs
+// the score cost, and rejects others that would cascade into permanent damage.
+//
+// Examples:
+//   - High tax in bootstrap: ACCEPT (score cost < 14 pts but revenue enables building)
+//   - Pollution near residential: REJECT (blocks growth entirely at >128)
+//   - No police early: ACCEPT (crime avg ~50 = ~67 score cost, but saves $500+$100/yr)
+//   - Demand cap without special building: REJECT (-15% multiplicative = ~150 score cost)
+//   - Slight traffic: ACCEPT (traffic < 60 avg has minimal score impact)
+AIAdvisor.prototype._isPenaltyAcceptable = function(penaltyType, currentValue) {
+  var phase = this._getPhase();
+
+  switch (penaltyType) {
+    case 'pollution_near_residential':
+      // NEVER acceptable — hard blocks growth at 128, cascading land value destruction
+      return false;
+
+    case 'no_traffic_route':
+      // NEVER acceptable — zone will degrade, wasting the building cost entirely
+      return false;
+
+    case 'demand_cap':
+      // NEVER acceptable — -15% multiplicative penalty is devastating
+      return false;
+
+    case 'high_tax':
+      // Acceptable in bootstrap/early when we need revenue to build
+      // Each tax point costs ~14 score (10 from problem + cityTax direct)
+      if (phase === 'bootstrap' || phase === 'early') return true;
+      // In growth: only if very low crime/pollution offset the cost
+      if (phase === 'growth' && currentValue <= 8) return true;
+      return false;
+
+    case 'no_police':
+      // Acceptable in bootstrap/early — crime takes time to build up
+      // By pop ~40 we should have one; score cost accelerates after that
+      if (phase === 'bootstrap') return true;
+      if (phase === 'early' && (this.simulation._census.totalPop < 40)) return true;
+      return false;
+
+    case 'no_fire_station':
+      // Acceptable early — fires are random events, expected cost is low
+      // Fire penalty = firePop * 5, unlikely to happen without disaster
+      if (phase === 'bootstrap') return true;
+      if (phase === 'early' && (this.simulation._census.totalPop < 40)) return true;
+      return false;
+
+    case 'low_road_funding':
+      // Acceptable temporarily if saving for a critical purchase
+      // Roads degrade slowly (1/512 chance per tile per cycle)
+      if (this._shouldReserveFunds().totalReserved > 0) return true;
+      return false;
+
+    case 'slight_traffic':
+      // Traffic avg < 60 → minimal score impact (~80 problem points → ~107 score cost)
+      // vs building roads that could fund zones instead
+      return currentValue < 60;
+
+    case 'industrial_pollution':
+      // Industrial pollution (50/tile) is acceptable if industrial zones are
+      // placed far enough from residential (≥6 tiles, pollution disperses to ~3)
+      return true; // Always acceptable IF district rules are followed
+
+    default:
+      return false;
+  }
+};
+
+
+// Compute the score ROI of building a specific structure.
+// Returns estimated score points gained per $1000 spent (including maintenance).
+// The AI uses this to prioritize which buildings give the most score improvement.
+AIAdvisor.prototype._computeBuildingROI = function(buildingType) {
+  var census = this.simulation._census;
+
+  switch (buildingType) {
+    case 'police':
+      // Cost: $500 build + $100/yr maintenance
+      // Benefit: reduces crimeAverage → score improvement ≈ crimeReduction * 1.333
+      // First station in high-crime city: reduces avg by ~30-60
+      // Score gain: ~40-80 points
+      var crimeAvg = census.crimeAverage || 0;
+      if (census.policeStationPop === 0 && crimeAvg > 40) {
+        return Math.round(crimeAvg * 1.333 * 0.5 / 0.6); // ~50% reduction, $600 annual cost
+      }
+      return Math.round(Math.max(crimeAvg - 60, 0) * 0.3);
+
+    case 'fire':
+      // Cost: $500 build + $100/yr maintenance
+      // Benefit: prevents fire damage (firePop * 5 score penalty)
+      // Also: fire coverage boosts score multiplier (up to 10%)
+      // ROI depends on whether fires are happening
+      if (census.firePop > 0) return 200; // Active fires = critical
+      return Math.round((100 - census.fireStationPop * 20) * 0.5);
+
+    case 'stadium':
+      // Cost: $5000 build + $0/yr maintenance
+      // Benefit: removes resCap → +15% score (multiplicative!)
+      // At score 500, that's +75 points = 15 ROI per $1000
+      if (this.simulation._valves.resCap) return 150;
+      return 0;
+
+    case 'seaport':
+      // Cost: $3000 build
+      // Benefit: removes indCap → +15% score
+      if (this.simulation._valves.indCap) return 200;
+      return 0;
+
+    case 'airport':
+      // Cost: $10000 build
+      // Benefit: removes comCap → +15% score
+      if (this.simulation._valves.comCap) return 75;
+      return 0;
+
+    default:
+      return 0;
+  }
 };
 
 
@@ -1276,23 +1582,43 @@ AIAdvisor.prototype._analyzeServices = function(census, budget) {
   var phase = this._getPhase();
   var canAfford = budget.totalFunds >= 500 + MIN_RESERVE;
 
-  // --- First police station: build earlier than old AI ---
-  // Crime reduces land value → reduces revenue. Early station pays for itself.
-  if (totalPop > 40 && census.policeStationPop === 0 && canAfford) {
-    recs.push({
-      priority: PRIORITIES.SERVICES + 12,
-      message: 'Building first police station — crime prevention boosts land value.',
-      action: { type: 'build', tool: 'police' }
-    });
+  // --- First police station: ROI-driven timing ---
+  // Crime formula: (128 - landValue) + popDensity - policeEffect
+  // Each crime avg point costs ~1.333 score points.
+  // Police station costs $500 + $100/yr, but prevents crime→landValue→crime spiral.
+  // In early game, crime is low (few people = low density), so delay is ACCEPTABLE.
+  // But once crimeAverage > 40, the ROI is clearly positive.
+  if (census.policeStationPop === 0 && canAfford) {
+    var policeROI = this._computeBuildingROI('police');
+    var crimeAcceptable = this._isPenaltyAcceptable('no_police', census.crimeAverage);
+    if (!crimeAcceptable || policeROI > 30) {
+      recs.push({
+        priority: PRIORITIES.SERVICES + 12,
+        message: 'Building police station (ROI=' + policeROI + '). Crime avg ' +
+          Math.round(census.crimeAverage) + ' costing ~' +
+          Math.round(census.crimeAverage * 1.333) + ' score pts.',
+        action: { type: 'build', tool: 'police' }
+      });
+    }
   }
 
-  // --- First fire station: build proactively ---
-  if (totalPop > 40 && census.fireStationPop === 0 && canAfford) {
-    recs.push({
-      priority: PRIORITIES.SERVICES + 11,
-      message: 'Building first fire station — prevents catastrophic fire damage.',
-      action: { type: 'build', tool: 'fire' }
-    });
+  // --- First fire station: ROI-driven timing ---
+  // Fire penalty = firePop * 5, direct score subtraction.
+  // Station costs $500 + $100/yr. Also: fire coverage boosts score multiplier (up to 10%).
+  // In early game, fires are rare (random events), so delay is ACCEPTABLE.
+  // But the station pays for itself via the coverage score multiplier once pop > 40.
+  if (census.fireStationPop === 0 && canAfford) {
+    var fireROI = this._computeBuildingROI('fire');
+    var fireAcceptable = this._isPenaltyAcceptable('no_fire_station', census.firePop);
+    if (!fireAcceptable || fireROI > 20 || census.firePop > 0) {
+      recs.push({
+        priority: census.firePop > 0 ? PRIORITIES.SERVICES + 15 : PRIORITIES.SERVICES + 11,
+        message: census.firePop > 0 ?
+          census.firePop + ' active fires! Score penalty -' + (census.firePop * 5) + '. Build fire station NOW.' :
+          'Building fire station (ROI=' + fireROI + '). Coverage boosts score multiplier.',
+        action: { type: 'build', tool: 'fire' }
+      });
+    }
   }
 
   // --- Additional police based on actual coverage gaps ---
@@ -2151,14 +2477,26 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
 
   switch (toolName) {
     case 'residential':
-      // From residential.js: pollution > 128 = zone CANNOT grow at all
-      // Use 80 threshold for safety margin (pollution can spread)
-      if (pollution > 80) return -9999;
-      if (this._hasNearbyIndustrial(x, y, DISTRICT_RADIUS)) return -9999;
+      // === PROACTIVE POLLUTION CHECK ===
+      // From residential.js:121: pollution > 128 = zone CANNOT grow AT ALL.
+      // Use predicted pollution (includes future industrial/plant emissions)
+      // not just current blockMap value, so we never place into a future dead zone.
+      var predictedPollution = this._predictPollutionAt(x, y);
+      var effectivePollution = Math.max(pollution, predictedPollution);
+      if (effectivePollution > SAFE_RESIDENTIAL_POLLUTION) return -9999;
+      if (this._hasNearbyIndustrial(x, y, MIN_INDUSTRY_RESIDENTIAL_GAP)) return -9999;
+
+      // === PROACTIVE TRAFFIC ROUTING CHECK ===
+      // From traffic.js: residential routes to COMMERCIAL within 30 tiles.
+      // If no commercial zone reachable → traffic check WILL fail → zone degrades.
+      // This is wasted money. Never place without a route target.
+      if (!this._hasTrafficRouteTarget(x, y, 'residential')) {
+        score -= 200; // Heavy penalty — will likely fail traffic routing
+      }
 
       // Compute actual locationScore from source code formula:
       // evalResidential = min((landValue - pollution) * 32, 6000) - 3000
-      var netValue = landValue - pollution;
+      var netValue = landValue - effectivePollution;
       if (netValue < 0) netValue = 0;
       var locationScore = Math.min(netValue * 32, 6000) - 3000;
 
@@ -2168,17 +2506,36 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
       // Scale: 10% prob → +100 score, 15% → +150, etc
       score += Math.round(growthProb * 1000);
 
+      // Crime degrades land value → suppresses growth → cascading penalty
       score -= crime * 2;
       score -= traffic;
       if (this._hasNearbyResidential(x, y, 6)) score += 80;
-      // Traffic routing: must reach jobs within ~30 tiles
       if (this._hasNearbyCommercial(x, y, 15) || this._hasNearbyIndustrial(x, y, 25)) score += 30;
-      else score -= 50; // Will fail traffic check → degradation
+      else score -= 50;
       break;
 
     case 'commercial':
-      // Commercial uses cityCentreDistScoreMap as locationScore (-64 to 64)
+      // === PROACTIVE: Commercial REQUIRES power to grow (commercial.js:126) ===
+      // But can degrade without power. Unpowered commercial = actively losing money.
+      if (!this._hasNearbyPower(x, y, 6)) score -= 100;
+
+      // === PROACTIVE: Commercial growth cap = landValue >> 5 ===
+      // From commercial.js:48: growth stops when population > (landValue >> 5)
+      // Don't waste money placing commercial where it can't fully develop.
+      var maxComPop = this._maxCommercialPopAt(x, y);
+      if (maxComPop < 1) return -9999; // Land value too low — zone will NEVER grow
+      if (maxComPop < 3) score -= 60;  // Will be stunted
+      score += maxComPop * 20;         // Bonus for high growth potential
+
+      // === PROACTIVE: Commercial locationScore = cityCentreDistScore (-64 to 64) ===
+      // Commercial benefits enormously from center proximity
       if (pollution > 128) return -9999;
+
+      // === PROACTIVE TRAFFIC: Commercial routes to INDUSTRIAL ===
+      if (!this._hasTrafficRouteTarget(x, y, 'commercial')) {
+        score -= 200;
+      }
+
       score += landValue * 3;
       score -= pollution * 2;
       if (this._hasNearbyResidential(x, y, 10)) score += 50;
@@ -2188,30 +2545,54 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
       var cdx = x - this.map.cityCentreX;
       var cdy = y - this.map.cityCentreY;
       var dist = Math.sqrt(cdx * cdx + cdy * cdy);
-      score += Math.max(0, 64 - Math.floor(dist)); // Mirror cityCentreDistScoreMap
+      score += Math.max(0, 64 - Math.floor(dist));
       if (this._plan.initialized) {
         score -= Math.abs(y - this._plan.gridOriginY) * 3;
       }
       break;
 
     case 'industrial':
-      if (this._hasNearbyResidential(x, y, DISTRICT_RADIUS)) return -9999;
+      if (this._hasNearbyResidential(x, y, MIN_INDUSTRY_RESIDENTIAL_GAP)) return -9999;
+
+      // === PROACTIVE: Industrial pollutes (50/tile) ===
+      // Check that placing here won't push nearby residential zones over
+      // the 128 pollution threshold. Predict pollution AFTER this zone exists.
+      var nearbyResidential = this._hasNearbyResidential(x, y, 10);
+      if (nearbyResidential) {
+        // Adding industrial zone here would add ~50 pollution to nearby area
+        // Check if any nearby residential zone is already at risk
+        var nearResPollution = this._checkNearbyResidentialPollution(x, y, 10);
+        if (nearResPollution > 60) {
+          score -= 200; // Would push residential dangerously close to 128 block
+        }
+      }
+
+      // === PROACTIVE TRAFFIC: Industrial routes to RESIDENTIAL ===
+      if (!this._hasTrafficRouteTarget(x, y, 'industrial')) {
+        score -= 150; // Industrial is more forgiving (-1000 vs -3000 penalty)
+      }
+
       // Industrial doesn't care about land value or pollution
-      // but must be reachable from residential for traffic routing
-      score -= landValue; // Prefer cheap land
+      score -= landValue; // Prefer cheap land (saves land value for res/com)
       score += 30;
       if (this._hasNearbyIndustrial(x, y, 6)) score += 80;
       if (this._hasNearbyResidential(x, y, 25)) score += 20;
-      else score -= 30; // Traffic routing will fail
+      else score -= 30;
       break;
 
     case 'police':
-      // Place where coverage gap × population is highest
+      // === PROACTIVE: Police coverage radius ~8-10 tiles after 3 smoothing passes ===
+      // Crime formula: (128 - landValue) + popDensity - policeEffect
+      // Score cost: crimeAvg * 1.333 points. Each station saves ~40-80 score points.
       var policeEffect = this._safeBlockGet(blockMaps.policeStationEffectMap, x, y);
       score += (1000 - policeEffect);
-      score += crime * 3; // Weight crime more — direct score impact
+      score += crime * 3;
       score += popDensity * 2;
+      // Don't place within another station's radius — coverage overlaps waste money
       if (this._hasNearbyBuilding(x, y, TileValues.POLICESTATION, 15)) score -= 400;
+      // === PROACTIVE: Prefer placement that covers highest landValue areas ===
+      // Protecting high landValue prevents the crime→landValue→crime death spiral
+      score += landValue;
       break;
 
     case 'fire':
@@ -2248,26 +2629,43 @@ AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
   switch (toolName) {
     case 'coal':
     case 'nuclear':
-      // Keep away from residential (pollution source)
-      if (!this._hasNearbyResidential(x, y, 8)) score += 50;
-      // Prefer near industrial
+      // === PROACTIVE: Coal emits 100 pollution, nuclear also 100 ===
+      // Must keep FAR from residential. Coal at distance 4 from residential
+      // would add ~22 pollution (100 * 0.6^4), pushing marginal zones over 128.
+      // Safe distance: 8+ tiles from any residential zone.
+      if (!this._hasNearbyResidential(x, y, 10)) score += 100;
+      else if (!this._hasNearbyResidential(x, y, 8)) score += 30;
+      else return -9999; // Too close — will poison residential
+      // Check if this would push any nearby residential over pollution threshold
+      var nearResPollution = this._checkNearbyResidentialPollution(x, y, 12);
+      if (nearResPollution > 40) score -= 200; // Coal adds ~100 base, risky
+      // Prefer near industrial (already polluted, no downside)
       if (this._hasNearbyIndustrial(x, y, 10)) score += 30;
-      score -= landValue;
+      score -= landValue; // Prefer cheap land
       break;
 
     case 'stadium':
+      // Stadium removes resCap (+15% score). Place near high-density residential.
       var popDensity = this._safeBlockGet(blockMaps.populationDensityMap, x, y);
       score += popDensity * 2;
       score += landValue;
+      // Prefer residential side of city (north of main road in our layout)
+      if (this._plan.initialized && y < this._plan.gridOriginY) score += 30;
       break;
 
     case 'port':
+      // Seaport MUST be near water — no exceptions
       if (this._hasNearbyWater(x, y, 3)) score += 150;
       else score -= 500;
+      // Prefer industrial side (south) — seaport serves industry
+      if (this._plan.initialized && y > this._plan.gridOriginY) score += 20;
       break;
 
     case 'airport':
+      // Airport is 6x6 — needs lots of space. Prefer outskirts.
+      // Also generates some pollution from traffic, keep from residential.
       score -= landValue;
+      if (!this._hasNearbyResidential(x, y, 8)) score += 30;
       break;
   }
 
@@ -2382,6 +2780,27 @@ AIAdvisor.prototype._hasNearbyCommercial = function(x, y, radius) {
     }
   }
   return false;
+};
+
+
+// Check the maximum pollution at any nearby residential zone.
+// Used by industrial placement to avoid pushing residential zones
+// over the fatal 128 pollution threshold.
+AIAdvisor.prototype._checkNearbyResidentialPollution = function(x, y, radius) {
+  var map = this.map;
+  var maxPollution = 0;
+  for (var dy = -radius; dy <= radius; dy++) {
+    for (var dx = -radius; dx <= radius; dx++) {
+      var nx = x + dx;
+      var ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
+      if (TileUtils.isResidential(map.getTileValue(nx, ny))) {
+        var p = this._safeBlockGet(this.blockMaps.pollutionDensityMap, nx, ny);
+        if (p > maxPollution) maxPollution = p;
+      }
+    }
+  }
+  return maxPollution;
 };
 
 
