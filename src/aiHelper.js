@@ -342,6 +342,11 @@ AIHelper.prototype._executeNextAction = function() {
       description = 'Pollution remediation';
       break;
 
+    case 'cleanup_abandoned':
+      success = this._cleanupAbandonedZone();
+      description = 'Bulldozing abandoned zone';
+      break;
+
     default:
       break;
   }
@@ -826,15 +831,29 @@ AIHelper.prototype._buildZone = function(toolName) {
 
   if (!loc || loc.score < -100) return false;
 
+  // Pre-check: is there a connected road nearby that we can reach?
+  // If not, don't waste money on a zone that will be stranded.
+  if (size <= 3 && !this.advisor._hasNearbyConnectedRoad(loc.x, loc.y, 10) &&
+      !this.advisor._hasNearbyRoad(loc.x, loc.y, 3)) {
+    // No connected road within reach — skip this location
+    return false;
+  }
+
   tool.doTool(loc.x, loc.y, this.blockMaps);
   if (tool.result === tool.TOOLRESULT_OK) {
     tool.modifyIfEnoughFunding(budget);
     if (tool.result !== tool.TOOLRESULT_NO_MONEY) {
-      // Ensure road access (plain road — no wire wasted)
-      this._ensureRoadAccess(loc.x, loc.y, size);
+      // Ensure road access — now builds toward CONNECTED network
+      var roadOk = this._ensureRoadAccess(loc.x, loc.y, size);
       // Wire the MINIMUM path to connect this zone to the power grid
-      // (replaces old _wireAdjacentRoads that blanket-wired everything)
       this._ensurePowerAccess(loc.x, loc.y, size);
+
+      if (!roadOk) {
+        // Road connection failed — zone will be stranded.
+        // Infrastructure audit will try to fix it later.
+        // Don't count as success so AI doesn't keep doing this.
+        return false;
+      }
       return true;
     }
   }
@@ -977,6 +996,30 @@ AIHelper.prototype._bulldozeRubble = function() {
 };
 
 
+// ---- Abandoned zone cleanup ----
+//
+// Bulldoze zones that are stranded (no road, no power, far from network).
+// These zones will never grow and waste map space. Better to clear them
+// and let the AI build in a location that's actually connected.
+
+AIHelper.prototype._cleanupAbandonedZone = function() {
+  var budget = this.simulation.budget;
+  if (budget.totalFunds < 50) return false;
+
+  var abandoned = this.advisor.findAbandonedZone();
+  if (!abandoned) return false;
+
+  var bulldozerTool = this.tools.bulldozer;
+  bulldozerTool.doTool(abandoned.x, abandoned.y, this.blockMaps);
+  if (bulldozerTool.result === bulldozerTool.TOOLRESULT_OK) {
+    bulldozerTool.modifyIfEnoughFunding(budget);
+    return true;
+  }
+  bulldozerTool.clear();
+  return false;
+};
+
+
 // ---- Pollution remediation ----
 //
 // Active response to high pollution. Strategies in order:
@@ -1038,13 +1081,19 @@ AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
   var budget = this.simulation.budget;
 
   // Step 1: Check if zone already has road access via the network
-  if (this.advisor._hasAdjacentRoad(x, y)) return;
+  if (this.advisor._hasAdjacentRoad(x, y)) return true;
 
-  if (budget.totalFunds < 510) return;
+  if (budget.totalFunds < 510) return false;
 
-  // Step 2: Find the nearest road tile that's part of the actual network.
-  // Search outward in expanding rings to find it.
-  var nearestRoad = this.advisor._findNearestRoad(x, y);
+  // Step 2: Find the nearest road tile that's part of the CONNECTED network.
+  // This is the key fix — old code used _findNearestRoad() which could find
+  // disconnected road fragments, causing the AI to build toward them and
+  // creating MORE disconnected infrastructure.
+  var nearestRoad = this.advisor._findNearestConnectedRoad(x, y);
+  if (!nearestRoad) {
+    // Fall back to any road if no connected network exists yet (very early game)
+    nearestRoad = this.advisor._findNearestRoad(x, y);
+  }
   if (!nearestRoad) {
     // No road on the entire map — build a short stub as minimum
     for (var rx = x - half; rx <= x + half; rx++) {
@@ -1053,11 +1102,10 @@ AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
         this._buildRoad(rx, ry);
       }
     }
-    return;
+    return false; // Stub may not connect to anything
   }
 
   // Step 3: Build a road path from zone edge to the nearest network road.
-  // Start from the zone edge closest to the target road.
   var startX, startY;
   var dx = nearestRoad.x - x;
   var dy = nearestRoad.y - y;
@@ -1074,14 +1122,18 @@ AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
   // Walk from start toward target, building roads
   var cx = startX;
   var cy = startY;
-  var maxSteps = 20; // Cap spending — don't build 50-tile roads
+  var maxSteps = 20;
   var roadsBuilt = 0;
+  var reachedNetwork = false;
 
   for (var step = 0; step < maxSteps; step++) {
     if (budget.totalFunds < 10) break;
 
     // Check if we've reached the road network
-    if (TileUtils.isRoad(map.getTileValue(cx, cy))) break;
+    if (TileUtils.isRoad(map.getTileValue(cx, cy))) {
+      reachedNetwork = true;
+      break;
+    }
 
     // Build road at current position
     if (cx >= 0 && cy >= 0 && cx < map.width && cy < map.height) {
@@ -1091,7 +1143,7 @@ AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
     // Move toward target
     var ddx = nearestRoad.x - cx;
     var ddy = nearestRoad.y - cy;
-    if (ddx === 0 && ddy === 0) break;
+    if (ddx === 0 && ddy === 0) { reachedNetwork = true; break; }
 
     // Prefer the longer axis (Manhattan routing)
     if (Math.abs(ddx) >= Math.abs(ddy)) {
@@ -1100,6 +1152,8 @@ AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
       cy += (ddy > 0 ? 1 : -1);
     }
   }
+
+  return reachedNetwork;
 };
 
 
@@ -1209,7 +1263,23 @@ AIHelper.prototype._fixBrokenInfrastructure = function() {
 
   var fixed = false;
 
-  // Pass 1: Fix zones without road access
+  // Pass 1: Bulldoze truly abandoned zones (far from network, unsaveable)
+  // Do this FIRST so we don't waste money trying to connect unreachable zones.
+  if (budget.totalFunds >= 50) {
+    var abandoned = this.advisor.findAbandonedZone();
+    if (abandoned && abandoned.score >= 200) {
+      // Score >= 200 means far from connected network — bulldoze, don't fix
+      var bulldozerTool = this.tools.bulldozer;
+      bulldozerTool.doTool(abandoned.x, abandoned.y, this.blockMaps);
+      if (bulldozerTool.result === bulldozerTool.TOOLRESULT_OK) {
+        bulldozerTool.modifyIfEnoughFunding(budget);
+        return true; // Spend this cycle on cleanup
+      }
+      bulldozerTool.clear();
+    }
+  }
+
+  // Pass 2: Fix zones without road access (build toward CONNECTED network)
   for (var y = 1; y < map.height - 1; y++) {
     for (var x = 1; x < map.width - 1; x++) {
       if (budget.totalFunds < 100) return fixed;
@@ -1219,7 +1289,7 @@ AIHelper.prototype._fixBrokenInfrastructure = function() {
 
       // Check if this zone has any adjacent road (within 2 tiles for 3x3 zones)
       if (!this.advisor._hasAdjacentRoad(x, y)) {
-        // Zone has NO road access — build a connection
+        // Zone has NO road access — build a connection toward the real network
         this._ensureRoadAccess(x, y, 3);
         fixed = true;
         continue; // Move to next zone

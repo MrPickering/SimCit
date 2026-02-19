@@ -162,7 +162,201 @@ function AIAdvisor(simulation, gameMap, blockMaps) {
   this._lastValvePrediction = null;
   this._lastScoreBreakdown = null;
   this._lastStallDiagnosis = null;
+
+  // Road network connectivity map — rebuilt every analyze() cycle.
+  // Contains all road tiles reachable from the main road network.
+  // Prevents the AI from placing zones near disconnected road fragments.
+  this._connectedRoads = null;
 }
+
+
+// ---- Road network connectivity (BFS flood-fill) ----
+//
+// THE CORE FIX: The AI was checking "is there a road within N tiles?" but
+// NEVER checking "is that road connected to the main road network?"
+// Result: zones placed next to disconnected road fragments, then degrading.
+//
+// Solution: BFS from a known-good seed (grid origin or powered road) to find
+// ALL road tiles connected to the main network. Store in a Set for O(1) lookup.
+// Rebuilt every analyze() cycle (~200-500 road tiles, very fast).
+
+AIAdvisor.prototype._buildRoadNetworkMap = function() {
+  var map = this.map;
+  var network = {};
+  var seedX = -1, seedY = -1;
+
+  // Strategy 1: Start from grid origin — the starter city main road
+  if (this._plan.initialized) {
+    var gx = this._plan.gridOriginX;
+    var gy = this._plan.gridOriginY;
+    if (gx >= 0 && gy >= 0 && gx < map.width && gy < map.height &&
+        TileUtils.isRoad(map.getTileValue(gx, gy))) {
+      seedX = gx; seedY = gy;
+    }
+  }
+
+  // Strategy 2: Find any powered road tile (connected to working infrastructure)
+  if (seedX === -1) {
+    for (var sy = 0; sy < map.height && seedX === -1; sy += 2) {
+      for (var sx = 0; sx < map.width; sx += 2) {
+        if (TileUtils.isRoad(map.getTileValue(sx, sy)) && map.getTile(sx, sy).isPowered()) {
+          seedX = sx; seedY = sy; break;
+        }
+      }
+    }
+  }
+
+  // Strategy 3: Find any road tile at all
+  if (seedX === -1) {
+    for (var sy2 = 0; sy2 < map.height && seedX === -1; sy2++) {
+      for (var sx2 = 0; sx2 < map.width; sx2++) {
+        if (TileUtils.isRoad(map.getTileValue(sx2, sy2))) {
+          seedX = sx2; seedY = sy2; break;
+        }
+      }
+    }
+  }
+
+  if (seedX === -1) {
+    this._connectedRoads = network; // No roads on map
+    return;
+  }
+
+  // BFS from seed — find all connected road tiles
+  var queue = [[seedX, seedY]];
+  network[seedX + ',' + seedY] = true;
+
+  while (queue.length > 0) {
+    var pos = queue.shift();
+    var cx = pos[0], cy = pos[1];
+    var neighbors = [[cx-1,cy],[cx+1,cy],[cx,cy-1],[cx,cy+1]];
+    for (var i = 0; i < neighbors.length; i++) {
+      var nx = neighbors[i][0], ny = neighbors[i][1];
+      if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
+      var nkey = nx + ',' + ny;
+      if (network[nkey]) continue;
+      if (TileUtils.isRoad(map.getTileValue(nx, ny))) {
+        network[nkey] = true;
+        queue.push([nx, ny]);
+      }
+    }
+  }
+
+  this._connectedRoads = network;
+};
+
+
+// Check if a specific road tile is part of the connected main network.
+AIAdvisor.prototype._isRoadConnected = function(x, y) {
+  if (!this._connectedRoads) return false;
+  return !!this._connectedRoads[x + ',' + y];
+};
+
+
+// Find a CONNECTED road within radius — replaces _hasNearbyRoad for zone scoring.
+// This is the key difference: _hasNearbyRoad found ANY road (including fragments),
+// this only finds roads that are part of the actual working network.
+AIAdvisor.prototype._hasNearbyConnectedRoad = function(x, y, radius) {
+  if (!this._connectedRoads) return false;
+  var map = this.map;
+  for (var dy = -radius; dy <= radius; dy++) {
+    for (var dx = -radius; dx <= radius; dx++) {
+      var nx = x + dx;
+      var ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
+        if (TileUtils.isRoad(map.getTileValue(nx, ny)) &&
+            this._connectedRoads[nx + ',' + ny]) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+};
+
+
+// Find the nearest road tile that's part of the connected network.
+// Used by _ensureRoadAccess to build toward the REAL network, not fragments.
+AIAdvisor.prototype._findNearestConnectedRoad = function(x, y) {
+  if (!this._connectedRoads) return null;
+  var map = this.map;
+  for (var radius = 1; radius < 30; radius++) {
+    for (var dy = -radius; dy <= radius; dy++) {
+      for (var dx = -radius; dx <= radius; dx++) {
+        if (Math.abs(dx) !== radius && Math.abs(dy) !== radius) continue;
+        var nx = x + dx;
+        var ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
+          if (TileUtils.isRoad(map.getTileValue(nx, ny)) &&
+              this._connectedRoads[nx + ',' + ny]) {
+            return { x: nx, y: ny };
+          }
+        }
+      }
+    }
+  }
+  return null;
+};
+
+
+// Find an abandoned zone that should be bulldozed.
+// Zones are "abandoned" when they have no chance of recovering:
+//   1. No adjacent road AND far from connected network → unreachable
+//   2. Residential with pollution > 128 → growth permanently blocked
+//   3. Unpowered AND no road → double broken, will only degrade
+AIAdvisor.prototype.findAbandonedZone = function() {
+  var map = this.map;
+  var blockMaps = this.blockMaps;
+  var worst = null;
+  var worstScore = 0;
+
+  for (var y = 1; y < map.height - 1; y += 2) {
+    for (var x = 1; x < map.width - 1; x += 2) {
+      var tile = map.getTile(x, y);
+      if (!tile.isZone()) continue;
+
+      var score = 0;
+      var tv = map.getTileValue(x, y);
+      var hasRoad = this._hasAdjacentRoad(x, y);
+      var hasPower = tile.isPowered();
+      var pollution = this._safeBlockGet(blockMaps.pollutionDensityMap, x, y);
+
+      // Residential in lethal pollution zone — will NEVER grow
+      if (TileUtils.isResidential(tv) && pollution > 128) {
+        score += 100;
+      }
+
+      // No adjacent road — zone is disconnected, degrades immediately
+      if (!hasRoad) {
+        // Check if it's near the connected network (could be fixed)
+        if (!this._hasNearbyConnectedRoad(x, y, 8)) {
+          score += 200; // Far from network — unreachable, must bulldoze
+        } else {
+          score += 50; // Near network — fixBrokenInfrastructure may save it
+        }
+      }
+
+      // Unpowered — all zone types need power to grow
+      if (!hasPower) {
+        score += 30;
+      }
+
+      // Both broken — definitely dead
+      if (!hasRoad && !hasPower) {
+        score += 100;
+      }
+
+      if (score > worstScore) {
+        worstScore = score;
+        worst = { x: x, y: y, score: score, hasRoad: hasRoad, hasPower: hasPower };
+      }
+    }
+  }
+
+  // Only return zones that are truly abandoned (high score = multiple problems)
+  if (worst && worst.score >= 100) return worst;
+  return null;
+};
 
 
 // ---- Source-code-aware helper methods ----
@@ -1038,6 +1232,11 @@ AIAdvisor.prototype.analyze = function() {
 
   this._ensurePlanInitialized();
 
+  // === ROAD NETWORK: Rebuild connected road map every cycle ===
+  // This BFS identifies which roads are actually connected to the main network
+  // so zone scoring rejects locations near disconnected road fragments.
+  this._buildRoadNetworkMap();
+
   // === CLOSED-LOOP: Update trends and predictions FIRST ===
   this._updateTrends();
 
@@ -1135,6 +1334,7 @@ AIAdvisor.prototype.analyze = function() {
 
   recommendations = recommendations.concat(this._analyzePower(census, budget));
   recommendations = recommendations.concat(this._analyzePollution(census, budget));
+  recommendations = recommendations.concat(this._analyzeAbandonedZones(budget));
   recommendations = recommendations.concat(this._analyzeZoneDemand(census, valves, budget));
   recommendations = recommendations.concat(this._analyzeInfrastructure(census, budget));
   recommendations = recommendations.concat(this._analyzeTraffic(census));
@@ -2034,6 +2234,33 @@ AIAdvisor.prototype.findPollutionParkLocation = function() {
 };
 
 
+// ---- Abandoned zone cleanup ----
+//
+// Zones become "abandoned" when they lose road access, power, or are in
+// lethal pollution zones. These dead zones waste map space, contribute to
+// pollution (industrial), and drag down the score. The AI should detect
+// and bulldoze them so the space can be reused productively.
+
+AIAdvisor.prototype._analyzeAbandonedZones = function(budget) {
+  var recs = [];
+  if (budget.totalFunds < 200) return recs;
+
+  var abandoned = this.findAbandonedZone();
+  if (abandoned) {
+    recs.push({
+      priority: PRIORITIES.WIRE_CONNECT - 1, // Just below infrastructure fixes
+      message: 'Abandoned zone at (' + abandoned.x + ',' + abandoned.y + ')' +
+        (!abandoned.hasRoad ? ' — no road access' : '') +
+        (!abandoned.hasPower ? ' — no power' : '') +
+        '. Bulldozing to free space.',
+      action: { type: 'cleanup_abandoned' }
+    });
+  }
+
+  return recs;
+};
+
+
 // ---- Strategic park placement (land value → revenue feedback loop) ----
 //
 // From blockMapUtils.js:
@@ -2296,6 +2523,8 @@ AIAdvisor.prototype.findGridExpansionRoads = function(zoneType) {
 
   if (zoneType === 'residential') {
     // Extend main road east or west, then add a parallel road north
+    // CRITICAL: Always add vertical connectors between main road and parallel
+    // road, otherwise the parallel road is DISCONNECTED from the network.
     // Try extending east first
     var extendX = gx + 8;
     while (extendX < map.width - 5 && TileUtils.isRoad(map.getTileValue(extendX, gy))) {
@@ -2306,9 +2535,15 @@ AIAdvisor.prototype.findGridExpansionRoads = function(zoneType) {
       for (var rx = extendX; rx < extendX + 4 && rx < map.width; rx++) {
         path.push({ x: rx, y: gy });
       }
-      // Add parallel road north at gy-4 for new zone slots
-      for (var rx = extendX; rx < extendX + 4 && rx < map.width; rx++) {
-        if (gy - 4 >= 0) path.push({ x: rx, y: gy - 4 });
+      // Add vertical connector from main road to parallel road
+      if (gy - 4 >= 0) {
+        for (var ry = gy - 1; ry >= gy - 4; ry--) {
+          path.push({ x: extendX, y: ry });
+        }
+        // Add parallel road north at gy-4 for new zone slots
+        for (var rx2 = extendX + 1; rx2 < extendX + 4 && rx2 < map.width; rx2++) {
+          path.push({ x: rx2, y: gy - 4 });
+        }
       }
       return path;
     }
@@ -2321,6 +2556,12 @@ AIAdvisor.prototype.findGridExpansionRoads = function(zoneType) {
     if (extendX >= 2 && this._isAreaClear(extendX - 3, gy, 4, 1)) {
       for (var rx = extendX; rx > extendX - 4 && rx >= 0; rx--) {
         path.push({ x: rx, y: gy });
+      }
+      // Add vertical connector for west extension too
+      if (gy - 4 >= 0) {
+        for (var ry = gy - 1; ry >= gy - 4; ry--) {
+          path.push({ x: extendX, y: ry });
+        }
       }
       return path;
     }
@@ -2657,9 +2898,10 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
 
   // Road adjacency is critical — from simulation source:
   // zones without road access fail traffic check → DEGRADE
-  if (this._hasNearbyRoad(x, y, 2)) score += 150;
-  else if (this._hasNearbyRoad(x, y, 4)) score += 60;
-  else if (this._hasNearbyRoad(x, y, 8)) score += 10;
+  // MUST use connected road check — disconnected fragments don't count!
+  if (this._hasNearbyConnectedRoad(x, y, 2)) score += 150;
+  else if (this._hasNearbyConnectedRoad(x, y, 4)) score += 60;
+  else if (this._hasNearbyConnectedRoad(x, y, 8)) score += 10;
   else return -9999;
 
   // Power connectivity — unpowered zones get -500 to zoneScore
@@ -2695,12 +2937,12 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
       if (effectivePollution > SAFE_RESIDENTIAL_POLLUTION) return -9999;
       if (this._hasNearbyIndustrial(x, y, MIN_INDUSTRY_RESIDENTIAL_GAP)) return -9999;
 
-      // === PROACTIVE TRAFFIC ROUTING CHECK ===
+      // === HARD GATE: TRAFFIC ROUTING CHECK ===
       // From traffic.js: residential routes to COMMERCIAL within 30 tiles.
       // If no commercial zone reachable → traffic check WILL fail → zone degrades.
-      // This is wasted money. Never place without a route target.
+      // This is wasted money. NEVER place without a route target.
       if (!this._hasTrafficRouteTarget(x, y, 'residential')) {
-        score -= 200; // Heavy penalty — will likely fail traffic routing
+        return -9999; // HARD GATE — zone WILL degrade from routing failure
       }
 
       // Compute actual locationScore from source code formula:
@@ -2740,9 +2982,9 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
       // Commercial benefits enormously from center proximity
       if (pollution > 128) return -9999;
 
-      // === PROACTIVE TRAFFIC: Commercial routes to INDUSTRIAL ===
+      // === HARD GATE: Commercial routes to INDUSTRIAL ===
       if (!this._hasTrafficRouteTarget(x, y, 'commercial')) {
-        score -= 200;
+        return -9999; // HARD GATE — zone WILL degrade from routing failure
       }
 
       score += landValue * 3;
@@ -2778,9 +3020,9 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
         }
       }
 
-      // === PROACTIVE TRAFFIC: Industrial routes to RESIDENTIAL ===
+      // === HARD GATE: Industrial routes to RESIDENTIAL ===
       if (!this._hasTrafficRouteTarget(x, y, 'industrial')) {
-        score -= 150; // Industrial is more forgiving (-1000 vs -3000 penalty)
+        return -9999; // HARD GATE — zone WILL degrade from routing failure
       }
 
       // Industrial doesn't care about land value or pollution
@@ -2829,9 +3071,10 @@ AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
   var score = 0;
   var blockMaps = this.blockMaps;
 
-  if (this._hasNearbyRoad(x, y, 4)) score += 80;
-  else if (this._hasNearbyRoad(x, y, 8)) score += 20;
-  else score -= 150;
+  // Must be near CONNECTED road network — disconnected fragments don't count
+  if (this._hasNearbyConnectedRoad(x, y, 4)) score += 80;
+  else if (this._hasNearbyConnectedRoad(x, y, 8)) score += 20;
+  else return -9999; // Too far from connected road network
 
   if (this._hasNearbyPower(x, y, 6)) score += 40;
 
