@@ -1,39 +1,50 @@
-/* AI Advisor for SimCit - Strategy Engine
+/* AI Advisor for SimCit - Strategy Engine (Source-Code-Aware Edition)
  *
- * Grid-based city planner with zone districts:
- *   - Residential: NORTH of main road (clean, low pollution)
- *   - Commercial: Along main road (central, accessible)
- *   - Industrial: SOUTH of main road (pollution contained)
- *   - Power plant: South-east, near industrial
+ * This AI has been designed with full knowledge of the simulation internals:
  *
- * Power math (work backwards from need):
- *   - Coal: 700 capacity = ~57 zones @ 12 tiles/zone, costs $3000
- *   - Nuclear: 2000 capacity = ~165 zones, costs $5000
- *   - Each zone ~12 power tiles (9 zone tiles + ~3 road/wire overhead)
- *   - 1 coal handles Town, City, and most of Capital
- *   - 2nd coal only when utilization > 80% (~45+ zones)
- *   - Nuclear only replaces 2+ coal at 80+ zones ($5k < 2×$3k)
+ * === TAX TABLE (valves.js) ===
+ * Index = min(cityTax + gameLevel, 20)
+ * [200, 150, 120, 100, 80, 50, 30, 0, -10, -40, -100, ...]
+ * Neutral point = index 7 → tax = 7 - gameLevel
+ * Easy(0): neutral@7, Medium(1): neutral@6, Hard(2): neutral@5
+ * Each point below neutral adds that bonus to ALL valve deltas every cycle.
+ * Tax 0 on Easy = +200/cycle to all valves. Tax 9 on Easy = -40/cycle.
  *
- * Employment balance (drives zone building):
- *   - employment = (comPop + indPop) / (resPop / 8)
- *   - Target range: 0.8 to 1.3
- *   - R:(C+I) ≈ 1:1 in zone count for balance
- *   - Below 0.8: prioritize C/I (need jobs)
- *   - Above 1.3: prioritize R (need workers)
- *   - Balanced: follow demand valves as tiebreaker
+ * === ZONE GROWTH (residential.js / commercial.js / industrial.js) ===
+ * zoneScore = valve + locationScore
+ * Growth if: zoneScore > -350 AND (zoneScore - 26380) > random16signed
+ * P(growth) = (zoneScore + 6388) / 65536  (when zoneScore > -350)
+ * Residential locationScore: (min(landValue-pollution,0)*32, cap 6000) - 3000
+ * Pollution > 128 = residential HARD BLOCK
+ * Zones assessed with 1-in-8 chance per scan cycle
  *
- * Progression targets:
- *   - Starter: 1 coal + 3R+1C+2I = ~$4500 of $20k budget
- *   - Town (2k pop): ~10 developed zones, 1 coal
- *   - City (10k pop): ~25 zones, 1 coal
- *   - Capital (50k pop): ~70 zones, 2 coal
- *   - Metropolis (100k+): 120+ zones, nuclear upgrade
+ * === SCORE (evaluation.js) ===
+ * problemSum = crime + pollution + (landValue*0.7) + (tax*10) + traffic + unemployment + fire
+ * baseScore = (250 - min(problemSum/3, 250)) * 4  → range 0-1000
+ * Penalties: ×0.85 per demand cap, ×0.85 per valve < -1000
+ * Score -= fireSeverity + cityTax (raw subtraction!)
+ * Final = average(oldScore, newScore)
  *
- * Key mechanics:
- *   - Revenue: floor(totalPop * landValueAvg / 120) * cityTax * FLevels
- *   - Traffic: MAX_TRAFFIC_DISTANCE = 30 tiles residential to jobs
- *   - Power: Propagates through CONDBIT tiles (wire, road+wire, zone tiles)
- *   - Zone growth: road access + power + pollution < 128 for residential
+ * === REVENUE (budget.js) ===
+ * taxFund = floor(totalPop * landValueAvg / 120) * cityTax * FLevels[gameLevel]
+ * FLevels = [1.4, 1.2, 0.8]  RLevels(road cost) = [0.7, 0.9, 1.2]
+ *
+ * === DEMAND CAPS (simulation.js) ===
+ * resCap: resPop > 500 && stadiumPop === 0  → valve clamped to 0
+ * indCap: indPop > 70 && seaportPop === 0
+ * comCap: comPop > 100 && airportPop === 0
+ *
+ * === VALVE ACCUMULATION (valves.js) ===
+ * employment = (comHist10[1] + indHist10[1]) / (resPop/8)  ← LAGGED data
+ * migration = normalizedResPop * (employment - 1)
+ * births = normalizedResPop * 0.02
+ * resRatio = (projectedResPop / normalizedResPop - 1) * 600 + taxTable[z]
+ * Valve += round(ratio), clamped to ±2000/±1500
+ *
+ * === LAND VALUE (blockMapUtils.js) ===
+ * landValue = (34 - cityCentreDistance/2) * 4 + terrainDensity - pollution
+ * Parks boost terrainDensity → higher land value → more revenue per capita
+ * Crime > 190 → landValue -= 20
  */
 
 import * as TileValues from './tileValues.ts';
@@ -61,14 +72,25 @@ var DISTRICT_RADIUS = 6;
 // Power math constants
 var COAL_CAPACITY = 700;
 var NUCLEAR_CAPACITY = 2000;
-var TILES_PER_ZONE = 12;      // 9 zone tiles + ~3 shared road/wire
-var PLANT_OVERHEAD = 16;       // 4x4 plant footprint
+var TILES_PER_ZONE = 12;
+var PLANT_OVERHEAD = 16;
 var POWER_BUILD_THRESHOLD = 0.80;
 
 // Employment balance targets
-var EMPLOYMENT_LOW = 0.8;      // Below: need more C/I jobs
-var EMPLOYMENT_HIGH = 1.3;     // Above: need more R residents
-var NUCLEAR_MIN_ZONES = 80;    // Don't build nuclear below this
+var EMPLOYMENT_LOW = 0.8;
+var EMPLOYMENT_HIGH = 1.3;
+var NUCLEAR_MIN_ZONES = 80;
+
+// Exact tax table from valves.js — the AI knows the source code
+var TAX_TABLE = [
+  200, 150, 120, 100, 80, 50, 30, 0, -10, -40, -100,
+  -150, -200, -250, -300, -350, -400, -450, -500, -550, -600
+];
+
+// Revenue multipliers by difficulty from budget.js
+var F_LEVELS = [1.4, 1.2, 0.8];
+// Road maintenance multipliers by difficulty
+var R_LEVELS = [0.7, 0.9, 1.2];
 
 function AIAdvisor(simulation, gameMap, blockMaps) {
   this.simulation = simulation;
@@ -80,17 +102,80 @@ function AIAdvisor(simulation, gameMap, blockMaps) {
     gridOriginX: 0,
     gridOriginY: 0
   };
+
+  // Track growth trends for predictive decisions
+  this._lastTotalPop = 0;
+  this._popGrowthRate = 0;
+  this._ticksSinceSpecialCheck = 0;
 }
 
+
+// ---- Source-code-aware helper methods ----
+
+// Get game difficulty level (0=Easy, 1=Medium, 2=Hard)
+AIAdvisor.prototype._getGameLevel = function() {
+  return this.simulation._gameLevel || 0;
+};
+
+// The EXACT neutral tax point where valve bonus = 0
+// From valves.js: index = min(cityTax + gameLevel, 20), neutral is index 7
+AIAdvisor.prototype._getNeutralTax = function() {
+  return Math.max(0, 7 - this._getGameLevel());
+};
+
+// Get the valve growth bonus/penalty for a given tax rate
+// This is what gets added to EVERY valve EVERY cycle
+AIAdvisor.prototype._getTaxValveEffect = function(taxRate) {
+  var index = Math.min(taxRate + this._getGameLevel(), 20);
+  return TAX_TABLE[index];
+};
+
+// Project annual revenue at a given tax rate
+// From budget.js: taxFund = floor(totalPop * landValueAvg / 120) * cityTax * FLevels
+AIAdvisor.prototype._projectRevenue = function(taxRate) {
+  var census = this.simulation._census;
+  var level = this._getGameLevel();
+  return Math.floor(Math.floor(census.totalPop * census.landValueAverage / 120) * taxRate * F_LEVELS[level]);
+};
+
+// Project total annual maintenance costs
+AIAdvisor.prototype._projectMaintenance = function() {
+  var census = this.simulation._census;
+  var level = this._getGameLevel();
+  var roadCost = (census.roadTotal * 1 + census.railTotal * 2) * R_LEVELS[level];
+  var serviceCost = (census.policeStationPop + census.fireStationPop) * 100;
+  return Math.floor(roadCost) + serviceCost;
+};
+
+// Calculate the score impact of current tax rate (from evaluation.js)
+// problemData[TAXES] = cityTax * 10, plus score -= cityTax at end
+AIAdvisor.prototype._getTaxScoreCost = function(taxRate) {
+  // Tax contributes taxRate*10 to problem sum, which feeds into:
+  // baseScore = (250 - min(sum/3, 250)) * 4
+  // So each tax point costs ~10/3*4 = ~13.3 score points from problems
+  // Plus score -= cityTax directly at the end
+  // Total: ~14.3 score points per tax level
+  return taxRate * 10 / 3 * 4 + taxRate;
+};
+
+// Estimate growth probability for a zone given current valve + location score
+// From residential.js: P(growth) = (zoneScore + 6388) / 65536 when > -350
+AIAdvisor.prototype._estimateGrowthProb = function(valve, locationScore) {
+  var zoneScore = valve + locationScore;
+  if (zoneScore <= -350) return 0;
+  return Math.max(0, (zoneScore + 6388) / 65536);
+};
 
 // ---- City plan management ----
 
 AIAdvisor.prototype._getPhase = function() {
   var census = this.simulation._census;
+  var budget = this.simulation.budget;
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
   if (totalZones === 0) return 'bootstrap';
   if (census.totalPop < 50) return 'early';
-  if (census.totalPop < 500) return 'growth';
+  // Stay in growth longer if we have money to invest
+  if (census.totalPop < 500 || (census.totalPop < 1000 && budget.totalFunds > 5000)) return 'growth';
   return 'metro';
 };
 
@@ -225,6 +310,8 @@ AIAdvisor.prototype.analyze = function() {
   recommendations = recommendations.concat(this._analyzeServices(census, budget));
   recommendations = recommendations.concat(this._analyzeBudgetInfo(budget, census));
   recommendations = recommendations.concat(this._analyzeSpecialBuildings(census, budget));
+  recommendations = recommendations.concat(this._analyzeParks(census, budget));
+  recommendations = recommendations.concat(this._analyzeScoreOptimization(census, budget, valves));
   recommendations = recommendations.concat(this._analyzeDisasterRecovery());
 
   recommendations.sort(function(a, b) { return b.priority - a.priority; });
@@ -253,29 +340,90 @@ AIAdvisor.prototype.decideBestAction = function() {
 };
 
 
-// ---- Budget actions (FREE) ----
+// ---- Budget actions (FREE — always check first) ----
+//
+// The OLD AI used a naive tax=7/9/6 heuristic. The NEW AI knows:
+// 1. Neutral tax depends on game level (7 on Easy, 6 on Medium, 5 on Hard)
+// 2. Lower tax = valve growth bonus = faster zone development
+// 3. Tax contributes ~14 score points per level (tax*10/3*4 + tax)
+// 4. Revenue = pop * landValue / 120 * tax * FLevels[level]
+// 5. Fast growth at low tax can yield MORE total revenue than slow growth at high tax
+//
+// Strategy: Use low taxes during growth (invest reserves in growth speed),
+// raise to neutral once cash flow is needed, never go above neutral+2 even in emergency.
 
 AIAdvisor.prototype._analyzeBudgetActions = function(budget, census) {
   var recs = [];
+  var phase = this._getPhase();
+  var neutralTax = this._getNeutralTax();
 
-  var optimalTax = 7;
-  if (budget.totalFunds < 1000 && census.totalPop > 0) {
-    optimalTax = 9;
-  } else if (budget.totalFunds > 15000) {
-    optimalTax = 6;
+  // --- Smart tax calculation ---
+  var optimalTax = neutralTax; // Default: neutral (zero valve effect)
+  var maintenance = this._projectMaintenance();
+
+  if (phase === 'bootstrap' || phase === 'early') {
+    // Growth investment: low tax to maximize valve accumulation
+    // Tax 0 on Easy = +200/cycle bonus to all valves!
+    // We have starting funds ($20k) to burn through
+    if (budget.totalFunds > 8000) {
+      optimalTax = Math.max(0, neutralTax - 4); // Aggressive growth
+    } else if (budget.totalFunds > 4000) {
+      optimalTax = Math.max(0, neutralTax - 2); // Moderate growth
+    } else {
+      optimalTax = neutralTax; // Preserve funds
+    }
+  } else if (phase === 'growth') {
+    // Balance growth speed vs revenue need
+    var annualRevenue = this._projectRevenue(neutralTax);
+    var surplus = annualRevenue - maintenance;
+
+    if (budget.totalFunds > 10000 && surplus > 0) {
+      // Flush with cash and profitable — invest in growth
+      optimalTax = Math.max(0, neutralTax - 3);
+    } else if (budget.totalFunds > 5000 && surplus > -200) {
+      optimalTax = Math.max(0, neutralTax - 2);
+    } else if (budget.totalFunds > 2000) {
+      optimalTax = Math.max(0, neutralTax - 1);
+    } else if (budget.totalFunds < 500) {
+      // Emergency: go above neutral but not too far (score penalty)
+      optimalTax = Math.min(neutralTax + 2, 10);
+    }
+  } else {
+    // Metro phase: optimize for score + sustainability
+    var annualRevenue = this._projectRevenue(neutralTax);
+    var surplus = annualRevenue - maintenance;
+
+    if (budget.totalFunds < 1000 || surplus < -500) {
+      // Need cash, but cap at neutral+2 to limit score damage
+      optimalTax = Math.min(neutralTax + 2, 10);
+    } else if (budget.totalFunds > 20000 && surplus > 1000) {
+      // Rich city — lower tax for score bonus and continued growth
+      optimalTax = Math.max(0, neutralTax - 2);
+    } else if (budget.totalFunds > 8000) {
+      optimalTax = Math.max(0, neutralTax - 1);
+    }
+    // else stay at neutral
   }
 
+  // Clamp to valid range
+  optimalTax = Math.max(0, Math.min(optimalTax, 20));
+
   if (budget.cityTax !== optimalTax) {
+    var effect = this._getTaxValveEffect(optimalTax);
+    var effectStr = effect > 0 ? '+' + effect : '' + effect;
     recs.push({
       priority: PRIORITIES.BUDGET_ADJUST,
-      message: 'Adjusting tax rate from ' + budget.cityTax + '% to ' + optimalTax + '%.',
+      message: 'Tax ' + budget.cityTax + '% -> ' + optimalTax + '% (valve: ' + effectStr + '/cycle, ' +
+        'score cost: ' + Math.round(this._getTaxScoreCost(optimalTax)) + ').',
       action: { type: 'set_tax', value: optimalTax }
     });
   }
 
+  // --- Service funding optimization ---
   var totalMaintenance = budget.roadMaintenanceBudget + budget.fireMaintenanceBudget + budget.policeMaintenanceBudget;
   if (totalMaintenance > 0 && budget.totalFunds < totalMaintenance && census.totalPop > 0) {
-    var targetRoad = Math.min(1.0, budget.totalFunds / budget.roadMaintenanceBudget);
+    // Triage: roads first (score penalty for degradation), then fire, then police
+    var targetRoad = Math.min(1.0, budget.totalFunds / Math.max(1, budget.roadMaintenanceBudget));
     var remaining = Math.max(0, budget.totalFunds - budget.roadMaintenanceBudget);
     var targetFire = budget.fireMaintenanceBudget > 0 ? Math.min(1.0, remaining / budget.fireMaintenanceBudget) : 1.0;
     remaining = Math.max(0, remaining - budget.fireMaintenanceBudget);
@@ -403,18 +551,22 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
     return recs;
   }
 
-  // Early phase: wait for positive cash flow before expanding
-  if (phase === 'early' && budget.cashFlow < 0) {
+  // OLD AI waited for positive cash flow in early phase — WRONG.
+  // With low taxes and $20k starting funds, we should INVEST in growth.
+  // The faster zones develop, the sooner we get tax revenue.
+  // Only stall if we're truly broke.
+  if (phase === 'early' && budget.totalFunds < 800) {
     recs.push({
       priority: PRIORITIES.BUDGET_INFO,
-      message: 'Waiting for positive cash flow ($' + budget.cashFlow + '/yr).'
+      message: 'Low funds ($' + budget.totalFunds + '). Waiting for revenue.'
     });
     return recs;
   }
 
-  // Phase-dependent reserve
-  var buildReserve = phase === 'early' ? 5000 :
-                     phase === 'growth' ? COMFORTABLE_FUNDS :
+  // Phase-dependent reserve — more aggressive in early/growth phases
+  // because growth speed compounds: more zones → more pop → more revenue
+  var buildReserve = phase === 'early' ? 1000 :
+                     phase === 'growth' ? 1500 :
                      phase === 'metro' ? 5000 : MIN_RESERVE;
   var canAffordZone = budget.totalFunds >= 200 + buildReserve;
 
@@ -589,46 +741,111 @@ AIAdvisor.prototype._analyzeTraffic = function(census) {
 };
 
 
-// ---- Services (with effect map awareness) ----
+// ---- Services (block-map-aware coverage analysis) ----
+//
+// From blockMapUtils.js:
+//   crimeScore = (128 - landValue) + populationDensity - policeStationEffect
+//   Police effect map smoothed 3x → effective radius ~15-20 tiles
+//   Each station costs $100/yr maintenance — must justify with score benefit
+//
+// From evaluation.js:
+//   problemData[CRIME] = crimeAverage (0-250)
+//   Crime contributes crimeAvg/3*4 ≈ crimeAvg*1.33 to score penalty
+//   So reducing crime average by 30 → ~40 point score improvement
+//
+// Strategy: Build first police/fire early (at pop 40+ instead of 60+),
+// add more based on actual coverage gaps in high-density areas.
 
 AIAdvisor.prototype._analyzeServices = function(census, budget) {
   var recs = [];
   var totalPop = census.totalPop;
-  var canAfford = budget.totalFunds >= 500 + COMFORTABLE_FUNDS;
+  var phase = this._getPhase();
+  var canAfford = budget.totalFunds >= 500 + MIN_RESERVE;
 
-  if (totalPop > 60 && census.policeStationPop === 0 && canAfford) {
+  // --- First police station: build earlier than old AI ---
+  // Crime reduces land value → reduces revenue. Early station pays for itself.
+  if (totalPop > 40 && census.policeStationPop === 0 && canAfford) {
     recs.push({
-      priority: PRIORITIES.SERVICES + 10,
-      message: 'No police! Crime rising. Building station ($500).',
+      priority: PRIORITIES.SERVICES + 12,
+      message: 'Building first police station — crime prevention boosts land value.',
       action: { type: 'build', tool: 'police' }
     });
   }
 
-  if (totalPop > 60 && census.fireStationPop === 0 && canAfford) {
+  // --- First fire station: build proactively ---
+  if (totalPop > 40 && census.fireStationPop === 0 && canAfford) {
     recs.push({
-      priority: PRIORITIES.SERVICES + 10,
-      message: 'No fire dept! Building station ($500).',
+      priority: PRIORITIES.SERVICES + 11,
+      message: 'Building first fire station — prevents catastrophic fire damage.',
       action: { type: 'build', tool: 'fire' }
     });
   }
 
-  if (census.crimeAverage > 100 && canAfford) {
-    recs.push({
-      priority: PRIORITIES.SERVICES + 5,
-      message: 'Crime high (avg ' + census.crimeAverage + '). Building police station.',
-      action: { type: 'build', tool: 'police' }
-    });
+  // --- Additional police based on actual coverage gaps ---
+  // policeStationEffect map: 0=no coverage, 1000=max coverage
+  // Crime contributes to score penalty AND reduces land value AND degrades zones
+  if (census.crimeAverage > 80 && canAfford && census.policeStationPop > 0) {
+    // Check if there are high-density areas with poor police coverage
+    var worstCoverage = this._findWorstServiceCoverage('police');
+    if (worstCoverage && worstCoverage.gap > 500) {
+      recs.push({
+        priority: PRIORITIES.SERVICES + 8,
+        message: 'Crime high (avg ' + census.crimeAverage + '). Coverage gap at (' +
+          worstCoverage.x + ',' + worstCoverage.y + '). Adding police.',
+        action: { type: 'build', tool: 'police' }
+      });
+    }
   }
 
-  if (census.firePop > 0 && census.fireStationPop === 0 && canAfford) {
-    recs.push({
-      priority: PRIORITIES.SERVICES + 8,
-      message: census.firePop + ' active fires! Need fire stations.',
-      action: { type: 'build', tool: 'fire' }
-    });
+  // --- Active fire emergency ---
+  if (census.firePop > 0) {
+    if (census.fireStationPop === 0 && canAfford) {
+      recs.push({
+        priority: PRIORITIES.SERVICES + 15,
+        message: census.firePop + ' active fires! Need fire station urgently.',
+        action: { type: 'build', tool: 'fire' }
+      });
+    }
+  }
+
+  // --- Additional fire stations for coverage ---
+  if (phase === 'metro' && canAfford && census.fireStationPop > 0) {
+    var worstFire = this._findWorstServiceCoverage('fire');
+    if (worstFire && worstFire.gap > 600) {
+      recs.push({
+        priority: PRIORITIES.SERVICES + 5,
+        message: 'Fire coverage gap detected. Adding fire station.',
+        action: { type: 'build', tool: 'fire' }
+      });
+    }
   }
 
   return recs;
+};
+
+// Find highest-population area with worst service coverage
+AIAdvisor.prototype._findWorstServiceCoverage = function(serviceType) {
+  var blockMaps = this.blockMaps;
+  var effectMap = serviceType === 'police' ? blockMaps.policeStationEffectMap : blockMaps.fireStationEffectMap;
+  var popMap = blockMaps.populationDensityMap;
+  var worstScore = -Infinity;
+  var result = null;
+
+  for (var y = 4; y < this.map.height - 4; y += 8) {
+    for (var x = 4; x < this.map.width - 4; x += 8) {
+      var pop = this._safeBlockGet(popMap, x, y);
+      if (pop < 20) continue; // Only care about populated areas
+      var effect = this._safeBlockGet(effectMap, x, y);
+      var gap = 1000 - effect; // 0=full coverage, 1000=no coverage
+      var score = gap + pop * 2; // Weight by population
+      if (score > worstScore) {
+        worstScore = score;
+        result = { x: x, y: y, gap: gap, pop: pop };
+      }
+    }
+  }
+
+  return result;
 };
 
 
@@ -660,33 +877,242 @@ AIAdvisor.prototype._analyzeBudgetInfo = function(budget, census) {
 };
 
 
-// ---- Special buildings ----
+// ---- Special buildings (PROACTIVE — source-code-aware cap thresholds) ----
+//
+// From simulation.js:
+//   resCap: resPop > 500 && stadiumPop === 0  → valve forced to 0, score ×0.85
+//   indCap: indPop > 70  && seaportPop === 0  → valve forced to 0, score ×0.85
+//   comCap: comPop > 100 && airportPop === 0  → valve forced to 0, score ×0.85
+//
+// OLD AI: build only AFTER cap hits. NEW AI: build BEFORE cap hits.
+// Each cap costs 15% of score. Building early prevents lost growth cycles.
 
 AIAdvisor.prototype._analyzeSpecialBuildings = function(census, budget) {
   var recs = [];
+  var valves = this.simulation._valves;
 
-  if (census.resPop > 500 && census.stadiumPop === 0 && budget.totalFunds >= 5000 + COMFORTABLE_FUNDS) {
+  // --- Stadium: resPop threshold is 500 ---
+  if (census.stadiumPop === 0) {
+    if (census.resPop > 500) {
+      // CAP IS ACTIVE — urgent, growth is being blocked right now
+      if (budget.totalFunds >= 5000 + MIN_RESERVE) {
+        recs.push({
+          priority: PRIORITIES.SPECIAL_BUILDINGS + 20,
+          message: 'URGENT: Res growth CAPPED (resPop ' + census.resPop + '/500). Stadium needed NOW.',
+          action: { type: 'build', tool: 'stadium' }
+        });
+      } else {
+        recs.push({
+          priority: PRIORITIES.SPECIAL_BUILDINGS + 15,
+          message: 'Res growth CAPPED! Saving for stadium ($5000). Have $' + budget.totalFunds + '.'
+        });
+      }
+    } else if (census.resPop > 350) {
+      // Approaching cap — start saving / build preemptively
+      if (budget.totalFunds >= 5000 + COMFORTABLE_FUNDS) {
+        recs.push({
+          priority: PRIORITIES.SPECIAL_BUILDINGS + 10,
+          message: 'Res approaching cap (' + census.resPop + '/500). Building stadium early.',
+          action: { type: 'build', tool: 'stadium' }
+        });
+      } else {
+        recs.push({
+          priority: PRIORITIES.BUDGET_INFO + 5,
+          message: 'Save for stadium! Res at ' + census.resPop + '/500 cap. Need $5000.'
+        });
+      }
+    }
+  }
+
+  // --- Seaport: indPop threshold is 70 ---
+  if (census.seaportPop === 0) {
+    if (census.indPop > 70) {
+      if (budget.totalFunds >= 3000 + MIN_RESERVE) {
+        recs.push({
+          priority: PRIORITIES.SPECIAL_BUILDINGS + 20,
+          message: 'URGENT: Ind growth CAPPED (indPop ' + census.indPop + '/70). Seaport needed NOW.',
+          action: { type: 'build', tool: 'port' }
+        });
+      } else {
+        recs.push({
+          priority: PRIORITIES.SPECIAL_BUILDINGS + 15,
+          message: 'Ind growth CAPPED! Saving for seaport ($3000).'
+        });
+      }
+    } else if (census.indPop > 45) {
+      if (budget.totalFunds >= 3000 + COMFORTABLE_FUNDS) {
+        recs.push({
+          priority: PRIORITIES.SPECIAL_BUILDINGS + 8,
+          message: 'Ind approaching cap (' + census.indPop + '/70). Building seaport early.',
+          action: { type: 'build', tool: 'port' }
+        });
+      }
+    }
+  }
+
+  // --- Airport: comPop threshold is 100 ---
+  if (census.airportPop === 0) {
+    if (census.comPop > 100) {
+      if (budget.totalFunds >= 10000 + MIN_RESERVE) {
+        recs.push({
+          priority: PRIORITIES.SPECIAL_BUILDINGS + 20,
+          message: 'URGENT: Com growth CAPPED (comPop ' + census.comPop + '/100). Airport needed NOW.',
+          action: { type: 'build', tool: 'airport' }
+        });
+      } else {
+        recs.push({
+          priority: PRIORITIES.SPECIAL_BUILDINGS + 15,
+          message: 'Com growth CAPPED! Saving for airport ($10000).'
+        });
+      }
+    } else if (census.comPop > 65) {
+      if (budget.totalFunds >= 10000 + COMFORTABLE_FUNDS) {
+        recs.push({
+          priority: PRIORITIES.SPECIAL_BUILDINGS + 8,
+          message: 'Com approaching cap (' + census.comPop + '/100). Building airport early.',
+          action: { type: 'build', tool: 'airport' }
+        });
+      } else {
+        recs.push({
+          priority: PRIORITIES.BUDGET_INFO + 5,
+          message: 'Save for airport! Com at ' + census.comPop + '/100 cap. Need $10000.'
+        });
+      }
+    }
+  }
+
+  return recs;
+};
+
+
+// ---- Strategic park placement (land value → revenue feedback loop) ----
+//
+// From blockMapUtils.js:
+//   landValue = (34 - dist/2)*4 + terrainDensity - pollution
+//   Parks increase terrainDensity at their location
+// From budget.js:
+//   taxFund = floor(totalPop * landValueAvg / 120) * cityTax * FLevels
+// So parks → higher landValueAvg → more revenue per capita.
+// At $25/park with no maintenance, parks have infinite ROI.
+//
+// From evaluation.js:
+//   problemData[HOUSING] = landValueAverage * 7/10
+// WARNING: Higher land value = MORE housing complaints!
+// But the revenue benefit outweighs this — housing problem is low-weight.
+
+AIAdvisor.prototype._analyzeParks = function(census, budget) {
+  var recs = [];
+  var phase = this._getPhase();
+
+  // Only recommend parks when we have surplus funds
+  if (phase === 'bootstrap' || phase === 'early') return recs;
+  if (budget.totalFunds < 2000) return recs;
+
+  // Parks are most valuable in metro phase for revenue optimization
+  var priority = phase === 'metro' ? PRIORITIES.PARKS + 10 : PRIORITIES.PARKS;
+
+  // Find best park location: high population density + near roads + low existing terrain
+  var bestScore = -Infinity;
+  var bestX = -1, bestY = -1;
+  var map = this.map;
+  var blockMaps = this.blockMaps;
+
+  for (var y = 2; y < map.height - 2; y += 3) {
+    for (var x = 2; x < map.width - 2; x += 3) {
+      if (map.getTileValue(x, y) !== 0) continue; // Must be empty dirt
+
+      var pop = this._safeBlockGet(blockMaps.populationDensityMap, x, y);
+      if (pop < 10) continue;
+
+      var score = pop * 2;
+      if (this._hasNearbyRoad(x, y, 2)) score += 30;
+      else continue; // Parks without road access don't help much
+      if (this._hasNearbyResidential(x, y, 4)) score += 40;
+
+      // Prefer areas with lower existing land value (more room to improve)
+      var lv = this._safeBlockGet(blockMaps.landValueMap, x, y);
+      if (lv < 100) score += 20;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
+
+  if (bestX !== -1) {
     recs.push({
-      priority: PRIORITIES.SPECIAL_BUILDINGS + 5,
-      message: 'Need stadium (res growth capped, -15% score). Building ($5000).',
-      action: { type: 'build', tool: 'stadium' }
+      priority: priority,
+      message: 'Strategic park placement — boosts land value and revenue.',
+      action: { type: 'build_park', x: bestX, y: bestY }
     });
   }
 
-  if (census.indPop > 70 && census.seaportPop === 0 && budget.totalFunds >= 3000 + COMFORTABLE_FUNDS) {
+  return recs;
+};
+
+
+// ---- Score optimization engine (direct problem-score reasoning) ----
+//
+// From evaluation.js, score is dominated by 7 problem categories:
+//   CRIME: crimeAverage (0-250)        → ~1.33 score per point
+//   POLLUTION: pollutionAverage (0-255) → ~1.33 score per point
+//   HOUSING: landValueAvg * 0.7         → ~0.93 score per point
+//   TAXES: cityTax * 10                 → ~1.33 score per tax level
+//   TRAFFIC: trafficAvg * 2.4           → ~3.2 score per traffic point
+//   UNEMPLOYMENT: complex formula       → ~1.33 score per point
+//   FIRE: firePop * 5                   → ~6.67 score per fire
+//
+// Plus multiplicative penalties:
+//   ×0.85 per demand cap (up to 3 = ×0.614)
+//   ×0.85 per valve < -1000 (up to 3 = ×0.614)
+//   Score -= fireSeverity + cityTax (raw subtraction)
+//   Score × powered_ratio
+
+AIAdvisor.prototype._analyzeScoreOptimization = function(census, budget, valves) {
+  var recs = [];
+  var eval_ = this.simulation.evaluation;
+  if (!eval_ || census.totalPop < 100) return recs;
+
+  // Identify the biggest score drains and recommend specific fixes
+
+  // Check for valve collapse penalties (×0.85 each, devastating)
+  if (valves.resValve < -1000) {
     recs.push({
-      priority: PRIORITIES.SPECIAL_BUILDINGS + 5,
-      message: 'Need seaport (ind growth capped, -15% score). Building ($3000).',
-      action: { type: 'build', tool: 'port' }
+      priority: PRIORITIES.BUDGET_INFO + 10,
+      message: 'SCORE DRAIN: Res valve collapsed (' + valves.resValve +
+        '). -15% score! Build commercial/industrial for jobs.'
+    });
+  }
+  if (valves.comValve < -1000) {
+    recs.push({
+      priority: PRIORITIES.BUDGET_INFO + 10,
+      message: 'SCORE DRAIN: Com valve collapsed (' + valves.comValve +
+        '). -15% score! Build residential for workers.'
+    });
+  }
+  if (valves.indValve < -1000) {
+    recs.push({
+      priority: PRIORITIES.BUDGET_INFO + 10,
+      message: 'SCORE DRAIN: Ind valve collapsed (' + valves.indValve +
+        '). -15% score! Build residential for workers.'
     });
   }
 
-  if (census.comPop > 100 && census.airportPop === 0 && budget.totalFunds >= 10000 + COMFORTABLE_FUNDS) {
-    recs.push({
-      priority: PRIORITIES.SPECIAL_BUILDINGS,
-      message: 'Need airport (com growth capped, -15% score). Building ($10000).',
-      action: { type: 'build', tool: 'airport' }
-    });
+  // Check unpowered zone ratio — score multiplied by powered/(powered+unpowered)
+  if (census.unpoweredZoneCount > 2) {
+    var total = census.poweredZoneCount + census.unpoweredZoneCount;
+    var ratio = census.poweredZoneCount / total;
+    if (ratio < 0.95) {
+      var scoreLoss = Math.round((1 - ratio) * 100);
+      recs.push({
+        priority: PRIORITIES.WIRE_CONNECT + 5,
+        message: 'SCORE DRAIN: ' + census.unpoweredZoneCount + ' unpowered zones = -' +
+          scoreLoss + '% score. Fix power connections!',
+        action: { type: 'wire_connect' }
+      });
+    }
   }
 
   return recs;
@@ -1091,21 +1517,37 @@ AIAdvisor.prototype.findTrafficBottleneck = function() {
 };
 
 
-// ---- Scoring (strict district enforcement + clustering) ----
+// ---- Zone scoring (source-code-aware growth probability) ----
+//
+// Key insight from residential.js:
+//   locationScore = min((landValue - pollution) * 32, 6000) - 3000
+//   zoneScore = valve + locationScore
+//   P(growth) = (zoneScore + 6388) / 65536 when zoneScore > -350
+//
+// So the AI should pick locations that maximize actual growth probability,
+// not just abstract "desirability". A zone with P(growth)=15% develops
+// 50% faster than one with P(growth)=10%.
+//
+// From blockMapUtils.js:
+//   landValue = (34 - cityCentreDistance/2) * 4 + terrainDensity - pollution
+// So distance from center and pollution are the dominant land value factors.
 
 AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   var score = 0;
   var blockMaps = this.blockMaps;
 
-  // Road adjacency is critical - zones without road access won't grow
+  // Road adjacency is critical — from simulation source:
+  // zones without road access fail traffic check → DEGRADE
   if (this._hasNearbyRoad(x, y, 2)) score += 150;
   else if (this._hasNearbyRoad(x, y, 4)) score += 60;
   else if (this._hasNearbyRoad(x, y, 8)) score += 10;
   else return -9999;
 
-  // Power connectivity
+  // Power connectivity — unpowered zones get -500 to zoneScore
+  // which drops growth probability significantly
   if (this._hasNearbyPower(x, y, 4)) score += 50;
   else if (this._hasNearbyPower(x, y, 8)) score += 20;
+  else score -= 30; // Will need wire run, slight penalty
 
   // Grid alignment bonus
   if (this._isGridAligned(x, y)) score += 40;
@@ -1116,10 +1558,7 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   var traffic = this._safeBlockGet(blockMaps.trafficDensityMap, x, y);
   var popDensity = this._safeBlockGet(blockMaps.populationDensityMap, x, y);
 
-  // HARD POSITIONAL DISTRICT RULES (based on grid origin)
-  // Residential: NORTH of main road only (y <= gridOriginY)
-  // Industrial: SOUTH of main road only (y > gridOriginY)
-  // This prevents mixing regardless of build order
+  // HARD POSITIONAL DISTRICT RULES
   if (this._plan.initialized) {
     var gridY = this._plan.gridOriginY;
     if (toolName === 'residential' && y > gridY) return -9999;
@@ -1128,63 +1567,80 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
 
   switch (toolName) {
     case 'residential':
-      // HARD REJECT: pollution kills residential (degrades at > 128)
-      if (pollution > 100) return -9999;
-      // HARD REJECT: industrial within district radius
+      // From residential.js: pollution > 128 = zone CANNOT grow at all
+      // Use 80 threshold for safety margin (pollution can spread)
+      if (pollution > 80) return -9999;
       if (this._hasNearbyIndustrial(x, y, DISTRICT_RADIUS)) return -9999;
-      score += landValue * 2;
-      score -= pollution * 4;
+
+      // Compute actual locationScore from source code formula:
+      // evalResidential = min((landValue - pollution) * 32, 6000) - 3000
+      var netValue = landValue - pollution;
+      if (netValue < 0) netValue = 0;
+      var locationScore = Math.min(netValue * 32, 6000) - 3000;
+
+      // Factor in actual growth probability
+      var resValve = this.simulation._valves.resValve;
+      var growthProb = this._estimateGrowthProb(resValve, locationScore);
+      // Scale: 10% prob → +100 score, 15% → +150, etc
+      score += Math.round(growthProb * 1000);
+
       score -= crime * 2;
       score -= traffic;
-      // Cluster bonus: residential near residential
       if (this._hasNearbyResidential(x, y, 6)) score += 80;
-      // Needs jobs within traffic routing distance
-      if (this._hasNearbyCommercial(x, y, 15) || this._hasNearbyIndustrial(x, y, 20)) score += 25;
+      // Traffic routing: must reach jobs within ~30 tiles
+      if (this._hasNearbyCommercial(x, y, 15) || this._hasNearbyIndustrial(x, y, 25)) score += 30;
+      else score -= 50; // Will fail traffic check → degradation
       break;
 
     case 'commercial':
+      // Commercial uses cityCentreDistScoreMap as locationScore (-64 to 64)
       if (pollution > 128) return -9999;
       score += landValue * 3;
       score -= pollution * 2;
-      // Needs residential nearby (labor)
       if (this._hasNearbyResidential(x, y, 10)) score += 50;
       else score -= 40;
-      // Cluster bonus
       if (this._hasNearbyCommercial(x, y, 6)) score += 60;
-      // Prefer near the main road (gridOriginY)
+      // Commercial locationScore is distance-based — closer to center is better
+      var cdx = x - this.map.cityCentreX;
+      var cdy = y - this.map.cityCentreY;
+      var dist = Math.sqrt(cdx * cdx + cdy * cdy);
+      score += Math.max(0, 64 - Math.floor(dist)); // Mirror cityCentreDistScoreMap
       if (this._plan.initialized) {
         score -= Math.abs(y - this._plan.gridOriginY) * 3;
       }
       break;
 
     case 'industrial':
-      // HARD REJECT: keep away from residential
       if (this._hasNearbyResidential(x, y, DISTRICT_RADIUS)) return -9999;
-      score -= landValue;
+      // Industrial doesn't care about land value or pollution
+      // but must be reachable from residential for traffic routing
+      score -= landValue; // Prefer cheap land
       score += 30;
-      // Cluster bonus: industrial near industrial
       if (this._hasNearbyIndustrial(x, y, 6)) score += 80;
-      // But must be reachable from residential for traffic routing
       if (this._hasNearbyResidential(x, y, 25)) score += 20;
+      else score -= 30; // Traffic routing will fail
       break;
 
     case 'police':
+      // Place where coverage gap × population is highest
       var policeEffect = this._safeBlockGet(blockMaps.policeStationEffectMap, x, y);
       score += (1000 - policeEffect);
-      score += crime * 2;
-      score += popDensity;
-      if (this._hasNearbyBuilding(x, y, TileValues.POLICESTATION, 15)) score -= 300;
+      score += crime * 3; // Weight crime more — direct score impact
+      score += popDensity * 2;
+      if (this._hasNearbyBuilding(x, y, TileValues.POLICESTATION, 15)) score -= 400;
       break;
 
     case 'fire':
       var fireEffect = this._safeBlockGet(blockMaps.fireStationEffectMap, x, y);
       score += (1000 - fireEffect);
       score += popDensity * 2;
-      if (this._hasNearbyBuilding(x, y, TileValues.FIRESTATION, 15)) score -= 300;
+      if (this._hasNearbyBuilding(x, y, TileValues.FIRESTATION, 15)) score -= 400;
       break;
   }
 
-  // Prefer closer to city center
+  // Prefer closer to city center — from blockMapUtils.js:
+  // landValue = (34 - cityCentreDistance/2) * 4 + terrain - pollution
+  // So center proximity is already baked into land value, but add small bonus
   var dx = x - this.map.cityCentreX;
   var dy = y - this.map.cityCentreY;
   score -= Math.sqrt(dx * dx + dy * dy) * 0.3;

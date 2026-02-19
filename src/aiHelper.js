@@ -184,11 +184,27 @@ AIHelper.prototype._updateStats = function() {
 
   var phase = this.advisor._getPhase();
 
+  // Show tax valve effect — the key insight the smart AI exploits
+  var taxEffect = this.advisor._getTaxValveEffect(budget.cityTax);
+  var taxEffectStr = taxEffect > 0 ? '+' + taxEffect : '' + taxEffect;
+  var neutralTax = this.advisor._getNeutralTax();
+
+  // Show demand cap warnings
+  var caps = [];
+  if (valves.resCap) caps.push('R');
+  if (valves.comCap) caps.push('C');
+  if (valves.indCap) caps.push('I');
+  var capStr = caps.length > 0 ? ' <span class="ai-demand-neg">CAP:' + caps.join(',') + '</span>' : '';
+
+  // Revenue projection
+  var projRevenue = this.advisor._projectRevenue(budget.cityTax);
+  var projMaint = this.advisor._projectMaintenance();
+
   $('#aiStatsContent').html(
-    '<div class="ai-stat">Phase: ' + phase + ' | Demand: R' + rBar + ' C' + cBar + ' I' + iBar + '</div>' +
-    '<div class="ai-stat">Power: ' + powerUtil + '% (' + zonesLeft + ' zones left) | Zones: ' + totalZones + '</div>' +
-    '<div class="ai-stat">Employment: ' + employment + '% | Crime: ' + (census.crimeAverage || 0) + '</div>' +
-    '<div class="ai-stat">Score: ' + eval_.cityScore + ' | $' + budget.totalFunds + ' (flow: $' + budget.cashFlow + ')</div>'
+    '<div class="ai-stat">Phase: ' + phase + ' | Demand: R' + rBar + ' C' + cBar + ' I' + iBar + capStr + '</div>' +
+    '<div class="ai-stat">Tax: ' + budget.cityTax + '% (neutral=' + neutralTax + ', valve ' + taxEffectStr + '/cycle)</div>' +
+    '<div class="ai-stat">Power: ' + powerUtil + '% (' + zonesLeft + ' left) | Emp: ' + employment + '% | Crime: ' + (census.crimeAverage || 0) + '</div>' +
+    '<div class="ai-stat">Score: ' + eval_.cityScore + ' | $' + budget.totalFunds + ' (rev $' + projRevenue + ' - maint $' + projMaint + ')</div>'
   );
 };
 
@@ -251,6 +267,11 @@ AIHelper.prototype._executeNextAction = function() {
     case 'expand_grid':
       success = this._expandGrid(action.action.zoneType);
       description = 'Expanding grid for ' + action.action.zoneType;
+      break;
+
+    case 'build_park':
+      success = this._buildParkAt(action.action.x, action.action.y);
+      description = 'Strategic park for land value';
       break;
 
     default:
@@ -443,8 +464,14 @@ AIHelper.prototype._buildStarterCity = function() {
     }
   }
 
-  // === Step 8: Optimal starting tax (7% = neutral in tax table) ===
-  this.simulation.budget.setTax(7);
+  // === Step 8: Growth-optimized starting tax ===
+  // OLD: fixed 7% (only neutral on Easy). NEW: use low tax for growth burst.
+  // From valves.js: taxTable index = cityTax + gameLevel
+  // Tax 3 on Easy = index 3 = +100/cycle valve bonus = explosive early growth
+  // We have $15k+ in reserves to cover the deficit.
+  var neutralTax = this.advisor._getNeutralTax();
+  var startTax = Math.max(0, neutralTax - 4); // Aggressive growth investment
+  this.simulation.budget.setTax(startTax);
 
   return true;
 };
@@ -597,45 +624,81 @@ AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
 };
 
 
+// Build a park at a specific location (from advisor recommendation)
+AIHelper.prototype._buildParkAt = function(x, y) {
+  var budget = this.simulation.budget;
+  if (budget.totalFunds < 525) return false;
+
+  var parkTool = this.tools.park;
+  parkTool.doTool(x, y, this.blockMaps);
+  if (parkTool.result === parkTool.TOOLRESULT_OK) {
+    parkTool.modifyIfEnoughFunding(budget);
+    return true;
+  }
+  parkTool.clear();
+  return false;
+};
+
+
+// When no other actions: place multiple parks per cycle for land value optimization.
+// Parks are $25 each with zero maintenance — best ROI in the game.
+// From blockMapUtils.js: parks boost terrainDensity → landValue → revenue.
 AIHelper.prototype._tryPlacePark = function() {
   var budget = this.simulation.budget;
   if (budget.totalFunds < 1000) return;
 
   var map = this.map;
   var blockMaps = this.blockMaps;
-  var bestScore = -Infinity;
-  var bestX = -1, bestY = -1;
 
-  for (var y = 2; y < map.height - 2; y += 5) {
-    for (var x = 2; x < map.width - 2; x += 5) {
+  // Find and rank all candidate park locations
+  var candidates = [];
+  for (var y = 2; y < map.height - 2; y += 3) {
+    for (var x = 2; x < map.width - 2; x += 3) {
       if (map.getTileValue(x, y) !== 0) continue;
 
       var pop = this.advisor._safeBlockGet(blockMaps.populationDensityMap, x, y);
-      if (pop < 10) continue;
+      if (pop < 8) continue;
 
-      var score = pop;
-      if (this.advisor._hasNearbyRoad(x, y, 2)) score += 20;
+      var score = pop * 2;
+      if (this.advisor._hasNearbyRoad(x, y, 2)) score += 30;
       else continue;
+      if (this.advisor._hasNearbyResidential(x, y, 4)) score += 40;
 
-      if (score > bestScore) {
-        bestScore = score;
-        bestX = x;
-        bestY = y;
-      }
+      // Prefer areas where land value improvement helps most
+      var lv = this.advisor._safeBlockGet(blockMaps.landValueMap, x, y);
+      if (lv < 100) score += 20;
+
+      candidates.push({ x: x, y: y, score: score });
     }
   }
 
-  if (bestX === -1) return;
+  if (candidates.length === 0) return;
 
-  var parkTool = this.tools.park;
-  parkTool.doTool(bestX, bestY, blockMaps);
-  if (parkTool.result === parkTool.TOOLRESULT_OK) {
-    parkTool.modifyIfEnoughFunding(budget);
-    this._actionCount++;
-    this._lastAction = 'Placed park';
-    $('#aiStatus').text('#' + this._actionCount + ': Placed park for land value');
-  } else {
-    parkTool.clear();
+  // Sort by score descending
+  candidates.sort(function(a, b) { return b.score - a.score; });
+
+  // Place up to 3 parks per idle cycle (they're cheap)
+  var parksPlaced = 0;
+  var maxParks = Math.min(3, candidates.length);
+
+  for (var i = 0; i < maxParks; i++) {
+    if (budget.totalFunds < 525) break;
+
+    var c = candidates[i];
+    var parkTool = this.tools.park;
+    parkTool.doTool(c.x, c.y, blockMaps);
+    if (parkTool.result === parkTool.TOOLRESULT_OK) {
+      parkTool.modifyIfEnoughFunding(budget);
+      parksPlaced++;
+    } else {
+      parkTool.clear();
+    }
+  }
+
+  if (parksPlaced > 0) {
+    this._actionCount += parksPlaced;
+    this._lastAction = 'Placed ' + parksPlaced + ' parks';
+    $('#aiStatus').text('#' + this._actionCount + ': Placed ' + parksPlaced + ' parks for land value');
   }
 };
 
