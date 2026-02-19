@@ -304,11 +304,40 @@ AIHelper.prototype._setFunding = function(road, fire, police) {
 };
 
 
-// ---- Core building: road + wire pair ----
+// ---- Core building: separate road and wire decisions ----
+//
+// OLD approach: _buildRoadWithWire on EVERY road = lazy, expensive ($15/tile).
+// NEW approach: Build roads cheap ($10), wire only the power backbone.
+//
+// From powerManager.js: power propagates through CONDBIT tiles via BFS flood.
+// A zone gets power if there's a continuous conductive path from a power plant.
+// Zone tiles themselves propagate power when powered, so once one adjacent
+// tile is conductive+powered, the whole zone lights up.
+//
+// Strategy:
+//   - Roads for TRAFFIC → plain road ($10)
+//   - Roads for POWER BACKBONE → road+wire ($15)
+//   - After zone placement → wire the MINIMUM path to reach power grid
 
+// Plain road — no wire, just for traffic. $10.
+AIHelper.prototype._buildRoad = function(x, y) {
+  var budget = this.simulation.budget;
+  if (budget.totalFunds < 10) return false;
+
+  var roadTool = this.tools.road;
+  roadTool.doTool(x, y, this.blockMaps);
+  if (roadTool.result === roadTool.TOOLRESULT_OK) {
+    roadTool.modifyIfEnoughFunding(budget);
+    return roadTool.result !== roadTool.TOOLRESULT_NO_MONEY;
+  }
+  roadTool.clear();
+  return false;
+};
+
+// Road + wire — for power backbone only. $15.
 AIHelper.prototype._buildRoadWithWire = function(x, y) {
   var budget = this.simulation.budget;
-  if (budget.totalFunds < 15) return false; // $10 road + $5 wire
+  if (budget.totalFunds < 15) return false;
 
   var roadTool = this.tools.road;
   roadTool.doTool(x, y, this.blockMaps);
@@ -317,10 +346,8 @@ AIHelper.prototype._buildRoadWithWire = function(x, y) {
     if (roadTool.result === roadTool.TOOLRESULT_NO_MONEY) return false;
   } else {
     roadTool.clear();
-    // Road might already exist - still wire it
   }
 
-  // Wire on top of road creates road+power hybrid (CONDBIT)
   var wireTool = this.tools.wire;
   wireTool.doTool(x, y, this.blockMaps);
   if (wireTool.result === wireTool.TOOLRESULT_OK) {
@@ -332,35 +359,167 @@ AIHelper.prototype._buildRoadWithWire = function(x, y) {
   return true;
 };
 
-
-// Wire adjacent road tiles to ensure zone gets power
-AIHelper.prototype._wireAdjacentRoads = function(x, y, size) {
-  var half = Math.floor(size / 2);
-  var wireTool = this.tools.wire;
+// Wire a single tile (add wire to existing road or empty tile). $5.
+AIHelper.prototype._wireOnly = function(x, y) {
   var budget = this.simulation.budget;
-  var map = this.map;
+  if (budget.totalFunds < 505) return false;
 
-  // Check all perimeter tiles around the zone
+  var wireTool = this.tools.wire;
+  wireTool.doTool(x, y, this.blockMaps);
+  if (wireTool.result === wireTool.TOOLRESULT_OK) {
+    wireTool.modifyIfEnoughFunding(budget);
+    return true;
+  }
+  wireTool.clear();
+  return false;
+};
+
+
+// ---- Deliberate power routing (replaces blanket _wireAdjacentRoads) ----
+//
+// After placing a zone, wire the MINIMUM tiles needed to connect it to
+// the power grid. Instead of wiring all ~8 perimeter roads ($40 wasted),
+// find the ONE best adjacent road tile closest to the existing power
+// backbone and wire only that tile (+ short path if needed).
+//
+// From powerManager.js: power BFS explores conductive neighbors.
+// So we just need ONE conductive connection from zone to the grid.
+
+AIHelper.prototype._ensurePowerAccess = function(x, y, size) {
+  var half = Math.floor(size / 2);
+  var map = this.map;
+  var budget = this.simulation.budget;
+
+  // Step 1: Check if zone already has power access
+  // (any adjacent tile that is conductive — power will flow through on next scan)
   for (var dy = -(half + 1); dy <= half + 1; dy++) {
     for (var dx = -(half + 1); dx <= half + 1; dx++) {
-      // Only perimeter
       if (Math.abs(dx) <= half && Math.abs(dy) <= half) continue;
       var nx = x + dx;
       var ny = y + dy;
       if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
-        var tv = map.getTileValue(nx, ny);
-        if (TileUtils.isRoad(tv) && !map.getTile(nx, ny).isConductive()) {
-          if (budget.totalFunds >= 505) {
-            wireTool.doTool(nx, ny, this.blockMaps);
-            if (wireTool.result === wireTool.TOOLRESULT_OK) {
-              wireTool.modifyIfEnoughFunding(budget);
-            } else {
-              wireTool.clear();
-            }
-          }
+        if (map.getTile(nx, ny).isConductive()) return; // Already connected
+      }
+    }
+  }
+
+  if (budget.totalFunds < 505) return;
+
+  // Step 2: Find the best adjacent road to wire.
+  // "Best" = closest to an existing powered/conductive tile, so power
+  // can flow through with minimal additional wiring.
+  var bestRoad = null;
+  var bestDist = Infinity;
+
+  for (var dy = -(half + 1); dy <= half + 1; dy++) {
+    for (var dx = -(half + 1); dx <= half + 1; dx++) {
+      if (Math.abs(dx) <= half && Math.abs(dy) <= half) continue;
+      var nx = x + dx;
+      var ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
+
+      var tv = map.getTileValue(nx, ny);
+      if (!TileUtils.isRoad(tv)) continue;
+      if (map.getTile(nx, ny).isConductive()) continue; // Already wired
+
+      // Score this road tile: how close is it to the nearest conductive tile?
+      var dist = this._distToConductive(nx, ny);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestRoad = { x: nx, y: ny };
+      }
+    }
+  }
+
+  if (!bestRoad) return;
+
+  // Step 3: Wire just that one road tile
+  this._wireOnly(bestRoad.x, bestRoad.y);
+
+  // Step 4: If that road isn't directly connected to the power grid,
+  // wire a short path from it toward the nearest conductive tile.
+  // (The advisor's wire_connect action will handle longer paths on next cycle)
+  if (bestDist > 1 && bestDist < 8 && budget.totalFunds >= 510) {
+    var nearest = this._findNearestConductive(bestRoad.x, bestRoad.y, 8);
+    if (nearest) {
+      this._wirePathBetween(bestRoad.x, bestRoad.y, nearest.x, nearest.y, 6);
+    }
+  }
+};
+
+// Manhattan-distance search for nearest conductive tile
+AIHelper.prototype._distToConductive = function(x, y) {
+  var map = this.map;
+  for (var r = 1; r <= 12; r++) {
+    for (var dy = -r; dy <= r; dy++) {
+      for (var dx = -r; dx <= r; dx++) {
+        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+        var nx = x + dx;
+        var ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
+          if (map.getTile(nx, ny).isConductive()) return r;
         }
       }
     }
+  }
+  return 999;
+};
+
+AIHelper.prototype._findNearestConductive = function(x, y, maxRadius) {
+  var map = this.map;
+  for (var r = 1; r <= maxRadius; r++) {
+    for (var dy = -r; dy <= r; dy++) {
+      for (var dx = -r; dx <= r; dx++) {
+        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+        var nx = x + dx;
+        var ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
+          if (map.getTile(nx, ny).isConductive()) return { x: nx, y: ny };
+        }
+      }
+    }
+  }
+  return null;
+};
+
+// Wire a short path between two points, following existing roads where possible.
+// Caps at maxSteps to avoid runaway spending.
+AIHelper.prototype._wirePathBetween = function(fromX, fromY, toX, toY, maxSteps) {
+  var map = this.map;
+  var budget = this.simulation.budget;
+  var cx = fromX;
+  var cy = fromY;
+
+  for (var step = 0; step < maxSteps; step++) {
+    if (cx === toX && cy === toY) break;
+    if (budget.totalFunds < 505) break;
+
+    var ddx = toX - cx;
+    var ddy = toY - cy;
+
+    // Try primary direction (toward target)
+    var nx, ny;
+    if (Math.abs(ddx) >= Math.abs(ddy)) {
+      nx = cx + (ddx > 0 ? 1 : -1);
+      ny = cy;
+    } else {
+      nx = cx;
+      ny = cy + (ddy > 0 ? 1 : -1);
+    }
+
+    if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
+      var tile = map.getTile(nx, ny);
+      if (tile.isConductive()) break; // Reached the grid
+
+      var tv = map.getTileValue(nx, ny);
+      if (TileUtils.isRoad(tv)) {
+        this._wireOnly(nx, ny);
+        cx = nx;
+        cy = ny;
+        continue;
+      }
+    }
+    break; // Can't route further
   }
 };
 
@@ -402,18 +561,33 @@ AIHelper.prototype._buildStarterCity = function() {
   if (coalTool.result === coalTool.TOOLRESULT_NO_MONEY) return false;
 
   // === Step 2: Main horizontal road at y=gy (city spine) ===
-  // 15 tiles from gx-7 to gx+7, with wire for power propagation
+  //
+  // Deliberate power routing:
+  // Power plant is at (gx+4, gy+9). Power must reach zones north of main road.
+  // The BACKBONE (wired): branch road (gx, gy+1..gy+8) + main road near zones.
+  // The PERIPHERY (plain): outer road tiles only needed for traffic access.
+  //
+  // Zone positions: R at gx-2, gx+2, gx+6 (north), C at gx-6 (north),
+  //                 I at gx-2, gx+2 (south, near plant cross-road).
+  // Wired backbone: main road gx-7 to gx+7 (zones adjacent to main road
+  //   need it conductive), branch gx down to plant, cross-road near plant.
+  // We wire the main road because ALL zones are adjacent to it — without it
+  // they'd all be unpowered. The branch and cross-road connect to the plant.
   var rx, ry;
+
+  // Main road: wire it because zones on both sides need power from it.
+  // This IS the power backbone — every zone touches this road.
   for (rx = gx - 7; rx <= gx + 7; rx++) {
     this._buildRoadWithWire(rx, gy);
   }
 
-  // === Step 3: Branch road south at x=gx (industrial access) ===
+  // Branch road south: power backbone from main road to plant area.
+  // Only need to wire from main road down to cross-road.
   for (ry = gy + 1; ry <= gy + 8; ry++) {
     this._buildRoadWithWire(gx, ry);
   }
 
-  // === Step 4: South cross-road at y=gy+8 (plant connection) ===
+  // Cross-road at plant: wire near industrial zones and plant connection.
   for (rx = gx - 3; rx <= gx + 3; rx++) {
     if (rx !== gx) {
       this._buildRoadWithWire(rx, gy + 8);
@@ -501,10 +675,11 @@ AIHelper.prototype._buildZone = function(toolName) {
   if (tool.result === tool.TOOLRESULT_OK) {
     tool.modifyIfEnoughFunding(budget);
     if (tool.result !== tool.TOOLRESULT_NO_MONEY) {
-      // Ensure road access (builds road+wire for power too)
+      // Ensure road access (plain road — no wire wasted)
       this._ensureRoadAccess(loc.x, loc.y, size);
-      // Wire any adjacent roads that aren't conductive
-      this._wireAdjacentRoads(loc.x, loc.y, size);
+      // Wire the MINIMUM path to connect this zone to the power grid
+      // (replaces old _wireAdjacentRoads that blanket-wired everything)
+      this._ensurePowerAccess(loc.x, loc.y, size);
       return true;
     }
   }
@@ -513,13 +688,14 @@ AIHelper.prototype._buildZone = function(toolName) {
 };
 
 
-// Build road connection (with wire for power)
+// Build road connection — plain roads for traffic, wire only the power path
 AIHelper.prototype._buildRoadConnection = function() {
   var pathOrLoc = this.advisor.findRoadToConnect();
   if (!pathOrLoc) {
+    // Traffic bottleneck: pure traffic relief, no wire needed
     var bottleneck = this.advisor.findTrafficBottleneck();
     if (bottleneck) {
-      return this._buildRoadWithWire(bottleneck.x, bottleneck.y);
+      return this._buildRoad(bottleneck.x, bottleneck.y);
     }
     return false;
   }
@@ -528,11 +704,25 @@ AIHelper.prototype._buildRoadConnection = function() {
   var success = false;
   var maxRoads = 10;
 
+  // Road connections to isolated zones: build plain roads first.
+  // Power will be handled by _ensurePowerAccess when zones are placed,
+  // or by the wire_connect action if zones already exist and are unpowered.
   for (var i = 0; i < Math.min(pathOrLoc.length, maxRoads); i++) {
-    if (budget.totalFunds < 515) break; // Reserve + road + wire
+    if (budget.totalFunds < 510) break;
     var pos = pathOrLoc[i];
-    if (this._buildRoadWithWire(pos.x, pos.y)) {
+    if (this._buildRoad(pos.x, pos.y)) {
       success = true;
+    }
+  }
+
+  // After building the road path, check if the target zone needs power.
+  // Wire just the one tile where the path meets the power grid.
+  if (success && pathOrLoc.length > 0) {
+    var lastPos = pathOrLoc[Math.min(pathOrLoc.length - 1, maxRoads - 1)];
+    var nearCond = this._findNearestConductive(lastPos.x, lastPos.y, 3);
+    if (nearCond) {
+      // Wire the road tile nearest to the conductive grid
+      this._wireOnly(lastPos.x, lastPos.y);
     }
   }
 
@@ -567,7 +757,9 @@ AIHelper.prototype._buildWireConnection = function() {
 };
 
 
-// Expand the grid to create new zone slots
+// Expand the grid to create new zone slots.
+// Plain roads only ($10/tile) — wire added later when zones are actually placed.
+// This saves $5/tile on speculative roads that may not need power routing.
 AIHelper.prototype._expandGrid = function(zoneType) {
   var roads = this.advisor.findGridExpansionRoads(zoneType);
   if (!roads || roads.length === 0) return false;
@@ -576,9 +768,9 @@ AIHelper.prototype._expandGrid = function(zoneType) {
   var success = false;
 
   for (var i = 0; i < roads.length; i++) {
-    if (budget.totalFunds < 515) break;
+    if (budget.totalFunds < 510) break;
     var pos = roads[i];
-    if (this._buildRoadWithWire(pos.x, pos.y)) {
+    if (this._buildRoad(pos.x, pos.y)) {
       success = true;
     }
   }
@@ -605,20 +797,20 @@ AIHelper.prototype._bulldozeRubble = function() {
 };
 
 
-// Ensure road+wire access for a zone
+// Ensure road access for a zone — plain roads, power handled separately.
 AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
   if (this.advisor._hasNearbyRoad(x, y, size)) return;
 
   var budget = this.simulation.budget;
-  if (budget.totalFunds < 520) return;
+  if (budget.totalFunds < 510) return;
 
   var half = Math.floor(size / 2);
 
-  // Build a short road+wire segment along the bottom edge
+  // Build a short plain road segment along the bottom edge
   for (var rx = x - half; rx <= x + half; rx++) {
     var ry = y + half + 1;
-    if (ry < this.map.height && budget.totalFunds >= 515) {
-      this._buildRoadWithWire(rx, ry);
+    if (ry < this.map.height && budget.totalFunds >= 510) {
+      this._buildRoad(rx, ry);
     }
   }
 };
