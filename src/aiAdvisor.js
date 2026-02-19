@@ -167,6 +167,13 @@ function AIAdvisor(simulation, gameMap, blockMaps) {
   // Contains all road tiles reachable from the main road network.
   // Prevents the AI from placing zones near disconnected road fragments.
   this._connectedRoads = null;
+
+  // Performance tracking — fed by aiHelper action outcomes
+  this._recentOutcomes = []; // Rolling window of {result, timestamp}
+  this._strategyOverride = null; // 'cautious' when failing too much
+  this._previousValvePrediction = null; // For prediction accuracy tracking
+  this._predictionHits = 0;
+  this._predictionTotal = 0;
 }
 
 
@@ -1585,6 +1592,16 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   var recs = [];
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
   var phase = this._getPhase();
+
+  // Self-correction: cautious mode suppresses zone building when failing too much.
+  // Infrastructure and budget actions still run — only new zone placement pauses.
+  if (this._strategyOverride === 'cautious' && totalZones > 0) {
+    recs.push({
+      priority: PRIORITIES.ZONE_DEMAND,
+      message: 'CAUTIOUS: Pausing zone building until performance improves.'
+    });
+    return recs;
+  }
 
   // Bootstrap: build starter city
   if (totalZones === 0 && census.totalPop === 0 && budget.totalFunds >= 4500) {
@@ -3354,6 +3371,218 @@ AIAdvisor.prototype._safeBlockGet = function(blockMap, x, y) {
   } catch (e) {
     return 0;
   }
+};
+
+
+// ---- Performance tracking & self-assessment ----
+
+// Record the outcome of an action (called by aiHelper after each action)
+AIAdvisor.prototype._recordOutcome = function(result) {
+  this._recentOutcomes.push({ result: result, time: Date.now() });
+  if (this._recentOutcomes.length > 20) this._recentOutcomes.shift();
+
+  // Self-correction: if >40% of recent outcomes are failures, go cautious
+  if (this._recentOutcomes.length >= 5) {
+    var fails = 0;
+    for (var i = 0; i < this._recentOutcomes.length; i++) {
+      if (this._recentOutcomes[i].result === 'fail') fails++;
+    }
+    if (fails / this._recentOutcomes.length > 0.4) {
+      this._strategyOverride = 'cautious';
+    } else {
+      this._strategyOverride = null;
+    }
+  }
+};
+
+
+// Check prediction accuracy — compare previous valve predictions against actual values
+AIAdvisor.prototype._checkPredictionAccuracy = function() {
+  var prev = this._previousValvePrediction;
+  var valves = this.simulation._valves;
+  if (!prev) return;
+
+  // Direction accuracy: did we correctly predict which way each valve moved?
+  var checks = [
+    { predicted: prev.nextRes, actual: valves.resValve, prevActual: prev.actualRes },
+    { predicted: prev.nextCom, actual: valves.comValve, prevActual: prev.actualCom },
+    { predicted: prev.nextInd, actual: valves.indValve, prevActual: prev.actualInd }
+  ];
+
+  for (var i = 0; i < checks.length; i++) {
+    var c = checks[i];
+    if (c.prevActual === undefined) continue;
+    var predictedDir = c.predicted > c.prevActual ? 1 : (c.predicted < c.prevActual ? -1 : 0);
+    var actualDir = c.actual > c.prevActual ? 1 : (c.actual < c.prevActual ? -1 : 0);
+    this._predictionTotal++;
+    if (predictedDir === actualDir) this._predictionHits++;
+  }
+};
+
+
+// Get phase-appropriate goals
+AIAdvisor.prototype._getPhaseGoals = function() {
+  var phase = this._getPhase();
+  var census = this.simulation._census;
+  var eval_ = this.simulation.evaluation;
+  var budget = this.simulation.budget;
+  var valves = this.simulation._valves;
+  var goals = [];
+
+  switch (phase) {
+    case 'bootstrap':
+      goals.push({
+        label: 'Starter city built',
+        met: (census.poweredZoneCount + census.unpoweredZoneCount) >= 3
+      });
+      goals.push({
+        label: 'Power plant placed',
+        met: census.coalPowerPop > 0 || census.nuclearPowerPop > 0
+      });
+      break;
+
+    case 'early':
+      goals.push({
+        label: 'Pop > 50',
+        met: census.totalPop > 50
+      });
+      goals.push({
+        label: 'All zones powered',
+        met: census.unpoweredZoneCount === 0
+      });
+      goals.push({
+        label: 'Score > 400',
+        met: eval_.cityScore > 400
+      });
+      break;
+
+    case 'growth':
+      goals.push({
+        label: 'Reach Town (2k)',
+        met: census.totalPop >= 2000
+      });
+      goals.push({
+        label: 'Score > 500',
+        met: eval_.cityScore > 500
+      });
+      goals.push({
+        label: 'Positive cash flow',
+        met: this._projectRevenue(budget.cityTax) > this._projectMaintenance()
+      });
+      goals.push({
+        label: 'No demand caps',
+        met: !valves.resCap && !valves.comCap && !valves.indCap
+      });
+      break;
+
+    case 'metro':
+      goals.push({
+        label: 'Reach City (10k)',
+        met: census.totalPop >= 10000
+      });
+      goals.push({
+        label: 'Score > 700',
+        met: eval_.cityScore > 700
+      });
+      goals.push({
+        label: 'Growing pop',
+        met: this._popGrowthRate > 0
+      });
+      goals.push({
+        label: 'No demand caps',
+        met: !valves.resCap && !valves.comCap && !valves.indCap
+      });
+      break;
+  }
+
+  return goals;
+};
+
+
+// Compute letter grade from multiple signals
+AIAdvisor.prototype._computeGrade = function(successRate, trend, goals, score) {
+  // Weighted: success rate 40%, trend 20%, goals 20%, absolute score 20%
+  var successScore = successRate; // 0-100
+
+  var trendScore;
+  if (trend === 'improving') trendScore = 100;
+  else if (trend === 'stable') trendScore = 60;
+  else trendScore = 20; // declining
+
+  var goalsMet = 0;
+  var goalsTotal = goals.length || 1;
+  for (var i = 0; i < goals.length; i++) {
+    if (goals[i].met) goalsMet++;
+  }
+  var goalsScore = (goalsMet / goalsTotal) * 100;
+
+  var absScore = Math.min(score / 7, 100); // score 700 = 100%
+
+  var weighted = successScore * 0.4 + trendScore * 0.2 + goalsScore * 0.2 + absScore * 0.2;
+
+  if (weighted >= 85) return 'A';
+  if (weighted >= 70) return 'B';
+  if (weighted >= 50) return 'C';
+  if (weighted >= 30) return 'D';
+  return 'F';
+};
+
+
+// Main performance metrics getter — called by aiHelper for UI updates
+AIAdvisor.prototype.getPerformanceMetrics = function(successCount, failCount, neutralCount, totalActions) {
+  var census = this.simulation._census;
+  var eval_ = this.simulation.evaluation;
+
+  // Success rate
+  var totalOutcomes = successCount + failCount + neutralCount;
+  var successRate = totalOutcomes > 0 ? Math.round(successCount / totalOutcomes * 100) : 0;
+
+  // Growth trend from _growthHistory
+  var trend = 'stable';
+  if (this._growthHistory.length >= 3) {
+    var recent = this._growthHistory.slice(-3);
+    var positiveCount = 0;
+    var negativeCount = 0;
+    for (var i = 0; i < recent.length; i++) {
+      if (recent[i] > 0) positiveCount++;
+      if (recent[i] < 0) negativeCount++;
+    }
+    if (positiveCount >= 2) trend = 'improving';
+    else if (negativeCount >= 2) trend = 'declining';
+  }
+
+  // Check prediction accuracy
+  this._checkPredictionAccuracy();
+  // Store current valve state for next comparison
+  if (this._lastValvePrediction) {
+    this._previousValvePrediction = {
+      nextRes: this._lastValvePrediction.nextRes,
+      nextCom: this._lastValvePrediction.nextCom,
+      nextInd: this._lastValvePrediction.nextInd,
+      actualRes: this.simulation._valves.resValve,
+      actualCom: this.simulation._valves.comValve,
+      actualInd: this.simulation._valves.indValve
+    };
+  }
+  var predictionAccuracy = this._predictionTotal > 0 ?
+    Math.round(this._predictionHits / this._predictionTotal * 100) : null;
+
+  // Phase goals
+  var goals = this._getPhaseGoals();
+
+  // Grade
+  var grade = this._computeGrade(successRate, trend, goals, eval_.cityScore);
+
+  return {
+    grade: grade,
+    successRate: successRate,
+    trend: trend,
+    goals: goals,
+    predictionAccuracy: predictionAccuracy,
+    totalActions: totalActions,
+    phase: this._getPhase(),
+    strategyOverride: this._strategyOverride
+  };
 };
 
 

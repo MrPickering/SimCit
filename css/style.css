@@ -442,6 +442,74 @@ nav li {
 #infobar .demand-high { opacity: 1; }
 #infobar .demand-low { opacity: 0.4; }
 
+/* AI Performance Badge in header */
+.ai-grade {
+  display: inline-block;
+  font-weight: 700;
+  font-size: 12px;
+  width: 20px;
+  height: 20px;
+  line-height: 20px;
+  text-align: center;
+  border-radius: 4px;
+  background-color: #666;
+  color: #fff;
+}
+
+.ai-trend {
+  font-size: 10px;
+  margin-left: 2px;
+}
+
+.ai-trend-up { color: #4caf50; }
+.ai-trend-down { color: #f44336; }
+.ai-trend-flat { color: #999; font-size: 7px; }
+
+/* AI Performance panel section */
+.ai-performance {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.ai-perf-grid {
+  padding: 4px 12px 8px;
+}
+
+.ai-perf-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 0;
+  font-size: 11px;
+}
+
+.ai-perf-label {
+  color: #888;
+}
+
+.ai-perf-value {
+  font-weight: 600;
+  color: #ccc;
+}
+
+.ai-perf-goals {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.ai-goal {
+  font-size: 11px;
+  padding: 1px 0;
+}
+
+.ai-goal-met {
+  color: #4caf50;
+}
+
+.ai-goal-unmet {
+  color: #ff9800;
+  opacity: 0.7;
+}
+
 #loadingBanner[data-hasscript=false] {
   display: none;
 }

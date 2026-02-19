@@ -91,6 +91,13 @@ MobileUI.prototype._createMobileInfoBar = function() {
             <span id="mobileDemandI" class="mobile-demand mobile-demand-i">I</span>
           </div>
         </div>
+        <div class="info-item info-ai-perf-mobile" id="mobileAiPerfBadge">
+          <div class="info-label">AI</div>
+          <div class="info-value">
+            <span id="mobileAiGrade">--</span>
+            <span id="mobileAiTrend"></span>
+          </div>
+        </div>
       </div>
     </div>
   `;

@@ -499,6 +499,39 @@
   }
 }
 
+/* Mobile AI Performance Badge */
+.info-ai-perf-mobile {
+  display: none;
+}
+
+.info-ai-perf-mobile.ai-perf-visible {
+  display: block;
+}
+
+.info-ai-perf-mobile .info-value {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
+#mobileAiGrade {
+  display: inline-block;
+  font-weight: 700;
+  font-size: 11px;
+  width: 18px;
+  height: 18px;
+  line-height: 18px;
+  text-align: center;
+  border-radius: 3px;
+  background-color: #666;
+  color: #fff;
+}
+
+#mobileAiTrend {
+  font-size: 9px;
+}
+
 /* Touch warning removal for mobile */
 @media (pointer: coarse) {
   #touchWarnWindow {

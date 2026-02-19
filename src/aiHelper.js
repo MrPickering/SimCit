@@ -50,6 +50,15 @@ function AIHelper(game) {
   this._lastAction = '';
   this._currentSpeed = this.simulation._speed;
 
+  // Performance tracking state
+  this._successCount = 0;
+  this._failCount = 0;
+  this._neutralCount = 0;
+  this._totalFundsSpent = 0;
+  this._scoreAtStart = 0;
+  this._popAtStart = 0;
+  this._pendingOutcome = null; // { beforeScore, beforePop, beforeFunds, type }
+
   this._initUI();
   this._startAdviceLoop();
 }
@@ -93,8 +102,17 @@ AIHelper.prototype.startAutoPlay = function() {
 
   this.autoPlayActive = true;
   this._actionCount = 0;
+  this._successCount = 0;
+  this._failCount = 0;
+  this._neutralCount = 0;
+  this._totalFundsSpent = 0;
+  this._pendingOutcome = null;
+  this._scoreAtStart = this.simulation.evaluation.cityScore;
+  this._popAtStart = this.simulation._census.totalPop;
+
   $('#aiAutoPlay').text('Stop Auto-Play').addClass('ai-active');
   $('#aiStatus').text('Auto-play active...').addClass('ai-status-active');
+  $('#aiPerfBadge').show();
 
   this._scheduleNextAction();
 };
@@ -107,8 +125,21 @@ AIHelper.prototype.stopAutoPlay = function() {
     this._autoPlayTimer = null;
   }
 
+  // Show summary stats
+  var totalOutcomes = this._successCount + this._failCount + this._neutralCount;
+  var successPct = totalOutcomes > 0 ? Math.round(this._successCount / totalOutcomes * 100) : 0;
+  var scoreDelta = this.simulation.evaluation.cityScore - this._scoreAtStart;
+  var popDelta = this.simulation._census.totalPop - this._popAtStart;
+  var scoreSign = scoreDelta >= 0 ? '+' : '';
+  var popSign = popDelta >= 0 ? '+' : '';
+
   $('#aiAutoPlay').text('Auto-Play').removeClass('ai-active');
-  $('#aiStatus').text('Auto-play stopped. ' + this._actionCount + ' actions taken.').removeClass('ai-status-active');
+  $('#aiStatus').text(
+    this._actionCount + ' actions | ' + successPct + '% success | Score ' +
+    scoreSign + scoreDelta + ' | Pop ' + popSign + popDelta
+  ).removeClass('ai-status-active');
+  $('#aiPerfBadge').hide();
+  $('#mobileAiPerfBadge').removeClass('ai-perf-visible');
 };
 
 
@@ -254,6 +285,10 @@ AIHelper.prototype._updateStats = function() {
     reserveInfo +
     stallInfo
   );
+
+  if (this.autoPlayActive) {
+    this._updatePerformanceBadge();
+  }
 };
 
 
@@ -281,6 +316,13 @@ AIHelper.prototype._executeNextAction = function() {
       return; // Spend this cycle on infrastructure, not new building
     }
   }
+
+  // Finalize previous action's outcome before starting new one
+  var currentScore = this.simulation.evaluation.cityScore;
+  var currentPop = this.simulation._census.totalPop;
+  this._finalizePendingOutcome(currentScore, currentPop);
+
+  var beforeFunds = this.simulation.budget.totalFunds;
 
   var action = this.advisor.decideBestAction();
   if (!action) {
@@ -360,6 +402,18 @@ AIHelper.prototype._executeNextAction = function() {
     if (action.action.tool) {
       this.advisor._lastZoneBuildType = action.action.tool;
     }
+
+    // Track spending
+    var spent = beforeFunds - this.simulation.budget.totalFunds;
+    if (spent > 0) this._totalFundsSpent += spent;
+
+    // Create pending outcome — will be evaluated on next action
+    this._pendingOutcome = {
+      beforeScore: currentScore,
+      beforePop: currentPop,
+      type: action.action.type
+    };
+
     $('#aiStatus').text('#' + this._actionCount + ': ' + description);
   }
 };
@@ -1310,6 +1364,97 @@ AIHelper.prototype._fixBrokenInfrastructure = function() {
 AIHelper.prototype.destroy = function() {
   if (this._autoPlayTimer) clearTimeout(this._autoPlayTimer);
   if (this._adviceTimer) clearInterval(this._adviceTimer);
+};
+
+
+// ---- Performance outcome tracking ----
+
+// Classify the previous action's outcome by comparing before/after metrics.
+// Called at the START of each new action (deferred evaluation gives sim time to react).
+AIHelper.prototype._finalizePendingOutcome = function(currentScore, currentPop) {
+  if (!this._pendingOutcome) return;
+
+  var p = this._pendingOutcome;
+  var scoreDelta = currentScore - p.beforeScore;
+  var popDelta = currentPop - p.beforePop;
+
+  var result;
+  if (scoreDelta > 0 || (popDelta > 0 && scoreDelta >= -5)) {
+    result = 'success';
+    this._successCount++;
+  } else if (scoreDelta < -10 || popDelta < -50) {
+    result = 'fail';
+    this._failCount++;
+  } else {
+    result = 'neutral';
+    this._neutralCount++;
+  }
+
+  // Feed result to advisor for self-correction
+  this.advisor._recordOutcome(result);
+  this._pendingOutcome = null;
+};
+
+
+// Update the visible performance badge in header and AI panel
+AIHelper.prototype._updatePerformanceBadge = function() {
+  var metrics = this.advisor.getPerformanceMetrics(
+    this._successCount, this._failCount, this._neutralCount, this._actionCount
+  );
+
+  // Header badge: grade letter + trend arrow
+  var gradeColors = { A: '#4caf50', B: '#8bc34a', C: '#ffeb3b', D: '#ff9800', F: '#f44336' };
+  var $grade = $('#aiGrade');
+  $grade.text(metrics.grade);
+  $grade.css('background-color', gradeColors[metrics.grade] || '#666');
+  $grade.css('color', metrics.grade === 'C' || metrics.grade === 'B' ? '#333' : '#fff');
+
+  var trendArrow = metrics.trend === 'improving' ? '\u25B2' :
+                   metrics.trend === 'declining' ? '\u25BC' : '\u25CF';
+  var trendClass = metrics.trend === 'improving' ? 'ai-trend-up' :
+                   metrics.trend === 'declining' ? 'ai-trend-down' : 'ai-trend-flat';
+  $('#aiTrend').text(trendArrow).attr('class', 'ai-trend ' + trendClass);
+
+  // Mobile badge
+  var $mobileGrade = $('#mobileAiGrade');
+  if ($mobileGrade.length) {
+    $mobileGrade.text(metrics.grade);
+    $mobileGrade.css('background-color', gradeColors[metrics.grade] || '#666');
+    $mobileGrade.css('color', metrics.grade === 'C' || metrics.grade === 'B' ? '#333' : '#fff');
+    $('#mobileAiTrend').text(trendArrow).attr('class', trendClass);
+    $('#mobileAiPerfBadge').addClass('ai-perf-visible');
+  }
+
+  // AI Panel performance section
+  var html = '<div class="ai-section-title">Performance</div>';
+  html += '<div class="ai-perf-grid">';
+  html += '<div class="ai-perf-row"><span class="ai-perf-label">Grade</span><span class="ai-perf-value" style="color:' + (gradeColors[metrics.grade] || '#666') + '">' + metrics.grade + '</span></div>';
+  html += '<div class="ai-perf-row"><span class="ai-perf-label">Success Rate</span><span class="ai-perf-value">' + metrics.successRate + '%</span></div>';
+  html += '<div class="ai-perf-row"><span class="ai-perf-label">Trend</span><span class="ai-perf-value ' + trendClass + '">' + metrics.trend + '</span></div>';
+  html += '<div class="ai-perf-row"><span class="ai-perf-label">$ Spent</span><span class="ai-perf-value">$' + this._totalFundsSpent.toLocaleString() + '</span></div>';
+
+  if (metrics.predictionAccuracy !== null) {
+    html += '<div class="ai-perf-row"><span class="ai-perf-label">Prediction</span><span class="ai-perf-value">' + metrics.predictionAccuracy + '%</span></div>';
+  }
+
+  if (metrics.strategyOverride) {
+    html += '<div class="ai-perf-row ai-demand-neg"><span class="ai-perf-label">Mode</span><span class="ai-perf-value">CAUTIOUS</span></div>';
+  }
+
+  // Goals checklist
+  if (metrics.goals.length > 0) {
+    html += '<div class="ai-perf-goals">';
+    for (var i = 0; i < metrics.goals.length; i++) {
+      var g = metrics.goals[i];
+      var icon = g.met ? '\u2713' : '\u25CB';
+      var cls = g.met ? 'ai-goal-met' : 'ai-goal-unmet';
+      html += '<div class="ai-goal ' + cls + '">' + icon + ' ' + g.label + '</div>';
+    }
+    html += '</div>';
+  }
+
+  html += '</div>';
+  $('#aiPerformance').html(html);
 };
 
 
