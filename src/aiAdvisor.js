@@ -52,11 +52,15 @@ import { TileUtils } from './tileUtils.js';
 
 var PRIORITIES = {
   EMERGENCY: 120,
-  POWER: 100,
+  POWER: 110,
+  // Infrastructure MUST be fixed before building new zones.
+  // Old ordering had WIRE_CONNECT=75 < ZONE_DEMAND=80, so the AI
+  // kept building new zones instead of powering existing ones.
+  // Fix: infrastructure > zone demand. Always.
+  WIRE_CONNECT: 105,       // Was 75 — unpowered zones are BROKEN zones
+  ROAD_CONNECT: 100,       // Was 90 — disconnected zones degrade immediately
   BUDGET_ADJUST: 95,
-  ROAD_CONNECT: 90,
   ZONE_DEMAND: 80,
-  WIRE_CONNECT: 75,
   SERVICES: 60,
   SPECIAL_BUILDINGS: 50,
   TRAFFIC: 45,
@@ -1362,6 +1366,33 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
       message: 'Low funds ($' + budget.totalFunds + '). Waiting for revenue.'
     });
     return recs;
+  }
+
+  // === INFRASTRUCTURE GATE ===
+  // HARD RULE: Do NOT build new zones if existing zones are broken.
+  // The old AI kept building zones at priority 92-100 while wire_connect
+  // sat at priority 75, so unpowered zones piled up forever.
+  // Fix: count broken zones and REFUSE to build until they're fixed.
+  var unpowered = census.unpoweredZoneCount;
+  var totalZoneCount = census.poweredZoneCount + unpowered;
+  if (unpowered > 2 && totalZoneCount > 6) {
+    // More than 2 unpowered zones = something is seriously wrong.
+    // Don't add MORE broken zones. Fix the existing ones first.
+    recs.push({
+      priority: PRIORITIES.WIRE_CONNECT + 5,
+      message: 'INFRASTRUCTURE HALT: ' + unpowered + ' unpowered zones. Fixing before building more.',
+      action: { type: 'wire_connect' }
+    });
+    // Also check if road connectivity is the root cause
+    var disconnected = this._countDisconnectedZones();
+    if (disconnected > 0) {
+      recs.push({
+        priority: PRIORITIES.ROAD_CONNECT + 5,
+        message: disconnected + ' zones without road access. Building connections.',
+        action: { type: 'build_roads' }
+      });
+    }
+    return recs; // STOP — no new zones until infrastructure is fixed
   }
 
   // === CLOSED-LOOP: Fund reservation for upcoming special buildings ===
@@ -2704,6 +2735,21 @@ AIAdvisor.prototype._hasAdjacentRoad = function(x, y) {
     }
   }
   return false;
+};
+
+
+// Count zones that have NO adjacent road — these are completely broken
+// and will fail every traffic check, degrading immediately.
+AIAdvisor.prototype._countDisconnectedZones = function() {
+  var map = this.map;
+  var count = 0;
+  for (var y = 1; y < map.height - 1; y++) {
+    for (var x = 1; x < map.width - 1; x++) {
+      if (!map.getTile(x, y).isZone()) continue;
+      if (!this._hasAdjacentRoad(x, y)) count++;
+    }
+  }
+  return count;
 };
 
 
