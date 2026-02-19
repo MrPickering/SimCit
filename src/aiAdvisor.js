@@ -113,9 +113,10 @@ var POLLUTION_RADIATION = 255;   // Nuclear meltdown radiation
 // After 2 passes, pollution at distance d from source ≈ source * 0.25^(d/2)
 // This means: industrial (50) at distance 4 → ~3 pollution, safe for residential.
 // Coal (100) at distance 6 → ~6 pollution, safe. Distance 2 → ~25, concerning.
-var SAFE_RESIDENTIAL_POLLUTION = 64;  // Hard block at 128, generous safety margin
-var MIN_INDUSTRY_RESIDENTIAL_GAP = 8; // Tiles between industry and residential
-var MIN_POWER_PLANT_RESIDENTIAL_GAP = 10; // Coal/nuclear are heavier polluters (100/tile)
+var SAFE_RESIDENTIAL_POLLUTION = 96;  // Hard block at 128. In compact cities, 60-100 is normal.
+                                      // 96 gives 32-point safety margin while not blocking ALL placement.
+var MIN_INDUSTRY_RESIDENTIAL_GAP = 6; // Tiles between industry and residential (was 8, too restrictive for compact cities)
+var MIN_POWER_PLANT_RESIDENTIAL_GAP = 6; // Coal/nuclear gap (was 10 → 21x21 exclusion zone killed all placement)
 
 // From blockMapUtils.js: crime = (128 - landValue) + populationDensity - policeEffect
 // Crime > 190 → additional -20 land value penalty (vicious cycle)
@@ -1132,9 +1133,12 @@ AIAdvisor.prototype._getPhase = function() {
   var budget = this.simulation.budget;
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
   if (totalZones === 0) return 'bootstrap';
-  if (census.totalPop < 50) return 'early';
-  // Stay in growth longer if we have money to invest
-  if (census.totalPop < 500 || (census.totalPop < 1000 && budget.totalFunds > 5000)) return 'growth';
+  // Early: zones exist but city hasn't developed yet
+  if (totalZones < 6 && census.totalPop < 100) return 'early';
+  // Growth: city is developing, invest aggressively
+  // Stay in growth with funds to invest — faster zones → more pop → more revenue
+  if (census.totalPop < 2000 || (census.totalPop < 5000 && budget.totalFunds > 5000)) return 'growth';
+  // Metro: large enough to focus on optimization and score
   return 'metro';
 };
 
@@ -1690,15 +1694,19 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
     return recs;
   }
 
-  // Don't build zones if power can't handle more
+  // Don't build zones if power can't handle more — but DO recommend building power.
+  // OLD: Returned a message with NO ACTION, leaving the AI with nothing to execute.
+  // NEW: Include an action to build coal/nuclear so the AI isn't stuck.
   var maxPower = census.coalPowerPop * COAL_CAPACITY + census.nuclearPowerPop * NUCLEAR_CAPACITY;
   var estConsumption = totalZones * TILES_PER_ZONE +
     (census.coalPowerPop + census.nuclearPowerPop) * PLANT_OVERHEAD;
   if (maxPower > 0 && estConsumption > maxPower * 0.90) {
+    var powerTool = (census.coalPowerPop >= 2 && totalZones >= NUCLEAR_MIN_ZONES) ? 'nuclear' : 'coal';
     recs.push({
-      priority: PRIORITIES.ZONE_DEMAND - 10,
+      priority: PRIORITIES.ZONE_DEMAND + 5,
       message: 'Power near capacity (' + Math.round(estConsumption / maxPower * 100) +
-        '%). Build power plant before adding zones.'
+        '%). Building ' + powerTool + ' plant before adding zones.',
+      action: { type: 'build', tool: powerTool }
     });
     return recs;
   }
@@ -3013,18 +3021,23 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   var nearbyZones = this._countNearbyZones(x, y, 6);
   score += nearbyZones * 40;
 
-  // === SPRAWL PENALTY (HARD DISTANCE LIMIT) ===
+  // === SPRAWL PENALTY (ZONE-TYPE AWARE) ===
   // Penalize locations far from the grid origin (starter city center).
-  // This prevents the AI from building at the edge of long road extensions.
+  // Industrial zones get SOFTER penalty — they naturally go south of core (further away)
+  // and need more space. Residential/commercial get stronger penalty for compactness.
   if (this._plan.initialized) {
     var gx = this._plan.gridOriginX;
     var gy = this._plan.gridOriginY;
     var distFromCore = Math.abs(x - gx) + Math.abs(y - gy);
-    score -= distFromCore * 3;
-    // Accelerating penalty past 20 tiles — sprawl becomes exponentially worse
-    if (distFromCore > 20) score -= (distFromCore - 20) * 6;
-    // Hard reject past 35 tiles — no zone should be this far from core
-    if (distFromCore > 35) return -9999;
+    var isIndustrial = (toolName === 'industrial');
+    // Industrial: softer penalty (1.5/tile vs 3/tile) and wider limits
+    var basePenalty = isIndustrial ? 1.5 : 3;
+    var accelPenalty = isIndustrial ? 3 : 6;
+    var accelThreshold = isIndustrial ? 25 : 20;
+    var hardCap = isIndustrial ? 45 : 35;
+    score -= distFromCore * basePenalty;
+    if (distFromCore > accelThreshold) score -= (distFromCore - accelThreshold) * accelPenalty;
+    if (distFromCore > hardCap) return -9999;
   }
 
   // Power connectivity — unpowered zones get -500 to zoneScore
@@ -3042,10 +3055,17 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   var traffic = this._safeBlockGet(blockMaps.trafficDensityMap, x, y);
   var popDensity = this._safeBlockGet(blockMaps.populationDensityMap, x, y);
 
-  // HARD POSITIONAL DISTRICT RULES
+  // DISTRICT RULES — residential north, industrial south of main road.
+  // Residential: STRONG penalty south of main road (pollution from industry),
+  // but allow a small buffer zone (up to 4 tiles south) for expansion flexibility.
+  // Industrial: HARD reject north of main road (would pollute residential).
   if (this._plan.initialized) {
     var gridY = this._plan.gridOriginY;
-    if (toolName === 'residential' && y > gridY) return -9999;
+    if (toolName === 'residential' && y > gridY) {
+      var southOverlap = y - gridY;
+      if (southOverlap > 4) return -9999; // Too far into industrial zone
+      score -= southOverlap * 80; // Strong penalty but not hard reject
+    }
     if (toolName === 'industrial' && y <= gridY) return -9999;
   }
 
@@ -3193,8 +3213,12 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
 AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
   var score = 0;
 
-  // SPRAWL PENALTY for large buildings too — keep them near the core
-  if (this._plan.initialized) {
+  // SPRAWL PENALTY for large buildings — but NOT for coal/nuclear power plants.
+  // Coal/nuclear MUST be far from residential (MIN_POWER_PLANT_RESIDENTIAL_GAP).
+  // Penalizing distance-from-core conflicts with that requirement because
+  // residential IS at the core. Power plants are exempt by design.
+  // Stadiums, ports, airports still get sprawl penalty.
+  if (this._plan.initialized && toolName !== 'coal' && toolName !== 'nuclear') {
     var gx = this._plan.gridOriginX;
     var gy = this._plan.gridOriginY;
     var distFromCore = Math.abs(x - gx) + Math.abs(y - gy);
