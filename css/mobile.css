@@ -154,6 +154,27 @@
   font-weight: 600;
 }
 
+.info-demand-mobile .info-value {
+  display: flex;
+  gap: 3px;
+}
+
+.mobile-demand {
+  font-weight: 700;
+  font-size: 11px;
+  width: 16px;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  border-radius: 2px;
+}
+
+.mobile-demand-r { background-color: rgba(0, 200, 0, 0.3); color: #4caf50; }
+.mobile-demand-c { background-color: rgba(0, 100, 255, 0.3); color: #42a5f5; }
+.mobile-demand-i { background-color: rgba(255, 200, 0, 0.3); color: #ffca28; }
+.mobile-demand.demand-high { opacity: 1; }
+.mobile-demand.demand-low { opacity: 0.4; }
+
 /* ============================================
    Mobile Quick Actions
    ============================================ */
