@@ -113,8 +113,9 @@ var POLLUTION_RADIATION = 255;   // Nuclear meltdown radiation
 // After 2 passes, pollution at distance d from source ≈ source * 0.25^(d/2)
 // This means: industrial (50) at distance 4 → ~3 pollution, safe for residential.
 // Coal (100) at distance 6 → ~6 pollution, safe. Distance 2 → ~25, concerning.
-var SAFE_RESIDENTIAL_POLLUTION = 80;  // Hard block at 128, safety margin
-var MIN_INDUSTRY_RESIDENTIAL_GAP = 6; // Tiles between industry and residential
+var SAFE_RESIDENTIAL_POLLUTION = 64;  // Hard block at 128, generous safety margin
+var MIN_INDUSTRY_RESIDENTIAL_GAP = 8; // Tiles between industry and residential
+var MIN_POWER_PLANT_RESIDENTIAL_GAP = 10; // Coal/nuclear are heavier polluters (100/tile)
 
 // From blockMapUtils.js: crime = (128 - landValue) + populationDensity - policeEffect
 // Crime > 190 → additional -20 land value penalty (vicious cycle)
@@ -343,9 +344,10 @@ AIAdvisor.prototype._diagnoseGrowthStall = function() {
   }
 
   // 5. Pollution blocking residential growth (hard block at >128 in residential.js:121)
-  if (census.pollutionAverage > 80) {
-    causes.push({cause: 'POLLUTION_BLOCK', severity: 3,
-      detail: 'Pollution avg ' + census.pollutionAverage + '. Residential blocks at 128. Move industry away.',
+  if (census.pollutionAverage > 60) {
+    var pollSeverity = census.pollutionAverage > 100 ? 5 : (census.pollutionAverage > 80 ? 4 : 3);
+    causes.push({cause: 'POLLUTION_BLOCK', severity: pollSeverity,
+      detail: 'Pollution avg ' + census.pollutionAverage + '. Residential HARD BLOCKS at 128. Industrial/coal too close.',
       fix: 'reduce_pollution'});
   }
 
@@ -1059,12 +1061,49 @@ AIAdvisor.prototype.analyze = function() {
 
   // === CLOSED-LOOP: Growth stall diagnosis ===
   // When stall detected, inject specific fix recommendations at HIGH priority
+  // CRITICAL: Stall fixes must include ACTIONS, not just messages.
   if (this._lastStallDiagnosis && this._lastStallDiagnosis.length > 0) {
     var topCause = this._lastStallDiagnosis[0];
-    recommendations.push({
+    var stallRec = {
       priority: PRIORITIES.EMERGENCY - 10,
       message: 'GROWTH STALL (' + this._stallCycles + ' cycles): ' + topCause.detail
-    });
+    };
+    // Convert diagnosis fix into an actual action the AI can execute
+    switch (topCause.fix) {
+      case 'reduce_pollution':
+        stallRec.action = { type: 'reduce_pollution' };
+        break;
+      case 'build_stadium':
+        stallRec.action = { type: 'build', tool: 'stadium' };
+        break;
+      case 'build_seaport':
+        stallRec.action = { type: 'build', tool: 'port' };
+        break;
+      case 'build_airport':
+        stallRec.action = { type: 'build', tool: 'airport' };
+        break;
+      case 'build_police':
+        stallRec.action = { type: 'build', tool: 'police' };
+        break;
+      case 'wire_connect':
+        stallRec.action = { type: 'wire_connect' };
+        break;
+      case 'lower_tax':
+        var neutralTax = this._getNeutralTax();
+        stallRec.action = { type: 'set_tax', value: Math.max(0, neutralTax - 3) };
+        break;
+      case 'raise_tax':
+        var neutralTax2 = this._getNeutralTax();
+        stallRec.action = { type: 'set_tax', value: Math.min(neutralTax2 + 2, 10) };
+        break;
+      case 'build_jobs':
+        stallRec.action = { type: 'build', tool: valves.comValve > valves.indValve ? 'commercial' : 'industrial' };
+        break;
+      case 'build_residential':
+        stallRec.action = { type: 'build', tool: 'residential' };
+        break;
+    }
+    recommendations.push(stallRec);
     // Add second cause if exists — often multiple bottlenecks compound
     if (this._lastStallDiagnosis.length > 1) {
       var secondCause = this._lastStallDiagnosis[1];
@@ -1095,6 +1134,7 @@ AIAdvisor.prototype.analyze = function() {
   }
 
   recommendations = recommendations.concat(this._analyzePower(census, budget));
+  recommendations = recommendations.concat(this._analyzePollution(census, budget));
   recommendations = recommendations.concat(this._analyzeZoneDemand(census, valves, budget));
   recommendations = recommendations.concat(this._analyzeInfrastructure(census, budget));
   recommendations = recommendations.concat(this._analyzeTraffic(census));
@@ -1856,6 +1896,144 @@ AIAdvisor.prototype._analyzeSpecialBuildings = function(census, budget) {
 };
 
 
+// ---- Active pollution remediation ----
+//
+// The AI must not just AVOID pollution — it must DETECT and FIX it when it occurs.
+// From residential.js:121: pollution > 128 = zone CANNOT grow.
+// From evaluation.js: pollutionAverage * 1.333 = direct score cost.
+// From blockMapUtils.js: pollution sources are industrial (50), coal (100), traffic (50-75).
+//
+// Remediation strategies (in priority order):
+//   1. Stop building industrial/coal near residential (prevention — handled by scoring)
+//   2. Bulldoze abandoned zones in heavily polluted residential areas (they're dead weight)
+//   3. Build parks near residential to boost land value (offsets pollution in landValue formula)
+//   4. If pollution is severe: prioritize parks over new zones
+//
+// This method generates ACTIONABLE recommendations with real actions the AI can execute.
+
+AIAdvisor.prototype._analyzePollution = function(census, budget) {
+  var recs = [];
+
+  // Only analyze pollution when it's actually a problem
+  if (census.pollutionAverage < 40 && census.totalPop < 100) return recs;
+
+  var breakdown = this._lastScoreBreakdown || this._calculateScoreBreakdown();
+
+  // === CRITICAL: Pollution is the #1 score problem ===
+  if (breakdown.biggestProblem === 'pollution' && breakdown.biggestProblemCost > 60) {
+    var pollutedRes = this.findPollutedResidentialZone();
+    if (pollutedRes) {
+      recs.push({
+        priority: PRIORITIES.ZONE_DEMAND + 15,
+        message: 'POLLUTION CRISIS (-' + breakdown.biggestProblemCost + ' score pts). ' +
+          'Residential at (' + pollutedRes.x + ',' + pollutedRes.y + ') has pollution ' +
+          pollutedRes.pollution + '/128. Remediating.',
+        action: { type: 'reduce_pollution' }
+      });
+    }
+  }
+
+  // === HIGH: Pollution average threatening residential zones ===
+  if (census.pollutionAverage > 60) {
+    // Check if any residential zones are being blocked
+    var blockedCount = this._countBlockedResidentialZones();
+    if (blockedCount > 0) {
+      recs.push({
+        priority: PRIORITIES.ZONE_DEMAND + 10,
+        message: blockedCount + ' residential zones blocked by pollution (>128). ' +
+          'Avg pollution: ' + census.pollutionAverage + '. Building parks to offset.',
+        action: { type: 'reduce_pollution' }
+      });
+    }
+  }
+
+  return recs;
+};
+
+
+// Find a residential zone in a high-pollution area that should be bulldozed
+// (pollution > 128 means it can NEVER grow — it's wasted space)
+AIAdvisor.prototype.findPollutedResidentialZone = function() {
+  var map = this.map;
+  var blockMaps = this.blockMaps;
+  var worst = null;
+  var worstPollution = 0;
+
+  for (var y = 2; y < map.height - 2; y += 2) {
+    for (var x = 2; x < map.width - 2; x += 2) {
+      var tv = map.getTileValue(x, y);
+      if (!TileUtils.isResidential(tv)) continue;
+
+      var pollution = this._safeBlockGet(blockMaps.pollutionDensityMap, x, y);
+      if (pollution > worstPollution) {
+        worstPollution = pollution;
+        worst = { x: x, y: y, pollution: pollution };
+      }
+    }
+  }
+
+  return worst;
+};
+
+
+// Count residential zones with pollution > 128 (growth-blocked)
+AIAdvisor.prototype._countBlockedResidentialZones = function() {
+  var map = this.map;
+  var blockMaps = this.blockMaps;
+  var count = 0;
+
+  for (var y = 2; y < map.height - 2; y += 3) {
+    for (var x = 2; x < map.width - 2; x += 3) {
+      var tv = map.getTileValue(x, y);
+      if (!TileUtils.isResidential(tv)) continue;
+      if (this._safeBlockGet(blockMaps.pollutionDensityMap, x, y) > 128) count++;
+    }
+  }
+
+  return count;
+};
+
+
+// Find the best location for a park that would help residential zones
+// near pollution sources. Parks boost terrainDensity → higher landValue.
+// From: landValue = (34 - dist/2)*4 + terrainDensity - pollution
+// So parks don't directly reduce pollution but boost the net landValue for
+// nearby residential zones, partially compensating for pollution damage.
+AIAdvisor.prototype.findPollutionParkLocation = function() {
+  var map = this.map;
+  var blockMaps = this.blockMaps;
+  var bestScore = -Infinity;
+  var bestX = -1, bestY = -1;
+
+  for (var y = 2; y < map.height - 2; y += 2) {
+    for (var x = 2; x < map.width - 2; x += 2) {
+      if (map.getTileValue(x, y) !== 0) continue; // Must be empty
+
+      // Score: near residential + in polluted area + near road
+      var score = 0;
+      var pollution = this._safeBlockGet(blockMaps.pollutionDensityMap, x, y);
+      if (pollution < 20) continue; // Only place anti-pollution parks in polluted areas
+
+      score += pollution; // More polluted = more benefit from park
+      if (this._hasNearbyResidential(x, y, 4)) score += 100;
+      else if (this._hasNearbyResidential(x, y, 8)) score += 40;
+      else continue; // Must be near residential to help
+      if (this._hasNearbyRoad(x, y, 2)) score += 30;
+      else continue; // Parks without road access don't register
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
+
+  if (bestX === -1) return null;
+  return { x: bestX, y: bestY, score: bestScore };
+};
+
+
 // ---- Strategic park placement (land value → revenue feedback loop) ----
 //
 // From blockMapUtils.js:
@@ -2583,18 +2761,20 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
       break;
 
     case 'industrial':
+      // HARD GATE: Never place industrial within MIN_INDUSTRY_RESIDENTIAL_GAP of residential
       if (this._hasNearbyResidential(x, y, MIN_INDUSTRY_RESIDENTIAL_GAP)) return -9999;
 
       // === PROACTIVE: Industrial pollutes (50/tile) ===
-      // Check that placing here won't push nearby residential zones over
-      // the 128 pollution threshold. Predict pollution AFTER this zone exists.
-      var nearbyResidential = this._hasNearbyResidential(x, y, 10);
-      if (nearbyResidential) {
-        // Adding industrial zone here would add ~50 pollution to nearby area
-        // Check if any nearby residential zone is already at risk
-        var nearResPollution = this._checkNearbyResidentialPollution(x, y, 10);
-        if (nearResPollution > 60) {
-          score -= 200; // Would push residential dangerously close to 128 block
+      // After smoothing: 50 * 0.6^d at distance d. Cumulative with other sources.
+      // Even at safe gap distance, check if adding 50 base here would compound
+      // with existing pollution to push nearby residential over threshold.
+      if (this._hasNearbyResidential(x, y, 12)) {
+        var nearResPollution = this._checkNearbyResidentialPollution(x, y, 12);
+        if (nearResPollution > 50) {
+          return -9999; // HARD GATE: residential already at risk, don't add more pollution
+        }
+        if (nearResPollution > 30) {
+          score -= 300; // Strong penalty — getting close to danger zone
         }
       }
 
@@ -2660,18 +2840,24 @@ AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
   switch (toolName) {
     case 'coal':
     case 'nuclear':
-      // === PROACTIVE: Coal emits 100 pollution, nuclear also 100 ===
-      // Must keep FAR from residential. Coal at distance 4 from residential
-      // would add ~22 pollution (100 * 0.6^4), pushing marginal zones over 128.
-      // Safe distance: 8+ tiles from any residential zone.
-      if (!this._hasNearbyResidential(x, y, 10)) score += 100;
-      else if (!this._hasNearbyResidential(x, y, 8)) score += 30;
-      else return -9999; // Too close — will poison residential
+      // === PROACTIVE: Coal/nuclear emit 100 pollution per tile ===
+      // After 2-pass smoothing: 100 * 0.6^d pollution at distance d.
+      //   d=4 → 13 pollution, d=6 → 5, d=8 → 2, d=10 → 0.6
+      // HARD GATE: NEVER place within MIN_POWER_PLANT_RESIDENTIAL_GAP of residential.
+      // Coal/nuclear at distance 6 from residential adds ~5 pollution but CUMULATIVE
+      // with existing sources (industry, traffic) can push over 128 threshold.
+      if (this._hasNearbyResidential(x, y, MIN_POWER_PLANT_RESIDENTIAL_GAP)) return -9999;
+      // Strong bonus for being far from residential
+      if (!this._hasNearbyResidential(x, y, 15)) score += 150;
+      else if (!this._hasNearbyResidential(x, y, 12)) score += 80;
       // Check if this would push any nearby residential over pollution threshold
-      var nearResPollution = this._checkNearbyResidentialPollution(x, y, 12);
-      if (nearResPollution > 40) score -= 200; // Coal adds ~100 base, risky
-      // Prefer near industrial (already polluted, no downside)
-      if (this._hasNearbyIndustrial(x, y, 10)) score += 30;
+      var nearResPollution = this._checkNearbyResidentialPollution(x, y, 15);
+      if (nearResPollution > 30) score -= 300; // Existing pollution + coal = danger
+      // Prefer near industrial (already polluted area, no downside)
+      if (this._hasNearbyIndustrial(x, y, 10)) score += 50;
+      // Prefer edges of map (away from everything)
+      var edgeBonus = Math.min(x, y, this.map.width - x, this.map.height - y);
+      if (edgeBonus < 15) score += 30;
       score -= landValue; // Prefer cheap land
       break;
 

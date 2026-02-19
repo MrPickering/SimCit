@@ -139,10 +139,17 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
+  width: 100%;
+  gap: 4px;
 }
 
 #mobileInfoBar .info-item {
   text-align: center;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 #mobileInfoBar .info-label {
@@ -152,6 +159,7 @@
 
 #mobileInfoBar .info-value {
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .info-demand-mobile .info-value {
@@ -339,9 +347,12 @@
 
   /* Show mobile UI elements */
   #mobileToolbarToggle,
-  #mobileInfoBar,
   #mobileQuickActions {
     display: flex;
+  }
+
+  #mobileInfoBar {
+    display: block;
   }
 
   #mobileToolPalette {

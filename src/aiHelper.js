@@ -337,6 +337,11 @@ AIHelper.prototype._executeNextAction = function() {
       description = 'Strategic park for land value';
       break;
 
+    case 'reduce_pollution':
+      success = this._reducePollution();
+      description = 'Pollution remediation';
+      break;
+
     default:
       break;
   }
@@ -408,24 +413,27 @@ AIHelper.prototype._buildRoadWithWire = function(x, y) {
   var budget = this.simulation.budget;
   if (budget.totalFunds < 15) return false;
 
+  var roadSuccess = false;
   var roadTool = this.tools.road;
   roadTool.doTool(x, y, this.blockMaps);
   if (roadTool.result === roadTool.TOOLRESULT_OK) {
     roadTool.modifyIfEnoughFunding(budget);
-    if (roadTool.result === roadTool.TOOLRESULT_NO_MONEY) return false;
+    roadSuccess = (roadTool.result !== roadTool.TOOLRESULT_NO_MONEY);
   } else {
     roadTool.clear();
   }
 
+  var wireSuccess = false;
   var wireTool = this.tools.wire;
   wireTool.doTool(x, y, this.blockMaps);
   if (wireTool.result === wireTool.TOOLRESULT_OK) {
     wireTool.modifyIfEnoughFunding(budget);
+    wireSuccess = (wireTool.result !== wireTool.TOOLRESULT_NO_MONEY);
   } else {
     wireTool.clear();
   }
 
-  return true;
+  return roadSuccess || wireSuccess;
 };
 
 // Wire a single tile (add wire to existing road or empty tile). $5.
@@ -965,6 +973,53 @@ AIHelper.prototype._bulldozeRubble = function() {
     return true;
   }
   bulldozerTool.clear();
+  return false;
+};
+
+
+// ---- Pollution remediation ----
+//
+// Active response to high pollution. Strategies in order:
+//   1. Build parks near polluted residential zones (boost landValue to compensate)
+//   2. Bulldoze abandoned/dead residential zones in pollution zones (they waste space)
+//
+// From residential.js:121: pollution > 128 = zone CANNOT grow.
+// From blockMapUtils.js: landValue = (34 - dist/2)*4 + terrain - pollution
+// Parks boost terrain density → partially offset pollution damage to land value.
+
+AIHelper.prototype._reducePollution = function() {
+  var budget = this.simulation.budget;
+
+  // Strategy 1: Build park near the most polluted residential area
+  // Parks cost $10, boost terrain density, partially offset pollution in landValue formula
+  if (budget.totalFunds >= 100) {
+    var parkLoc = this.advisor.findPollutionParkLocation();
+    if (parkLoc) {
+      var parkTool = this.tools.park;
+      parkTool.doTool(parkLoc.x, parkLoc.y, this.blockMaps);
+      if (parkTool.result === parkTool.TOOLRESULT_OK) {
+        parkTool.modifyIfEnoughFunding(budget);
+        return true;
+      }
+      parkTool.clear();
+    }
+  }
+
+  // Strategy 2: Bulldoze dead residential zones (pollution > 128, they'll never grow)
+  // This frees up the land and removes the "dead zone" from the city
+  if (budget.totalFunds >= 50) {
+    var polluted = this.advisor.findPollutedResidentialZone();
+    if (polluted && polluted.pollution > 128) {
+      var bulldozerTool = this.tools.bulldozer;
+      bulldozerTool.doTool(polluted.x, polluted.y, this.blockMaps);
+      if (bulldozerTool.result === bulldozerTool.TOOLRESULT_OK) {
+        bulldozerTool.modifyIfEnoughFunding(budget);
+        return true;
+      }
+      bulldozerTool.clear();
+    }
+  }
+
   return false;
 };
 
