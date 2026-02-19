@@ -1,28 +1,21 @@
 /* AI Helper for SimCit - Auto-Play Engine
  *
- * Integrates the AI Advisor strategy engine with the game:
- * 1. Advisory panel with recommendations
- * 2. Auto-play with optimal city building strategy
+ * Starter City: 1 coal ($3000) + 3R+1C+2I ($600) = ~$4200
+ *   R:(C+I) = 3:3 = 1:1 balanced employment from day one.
+ *   1 coal (700 cap) handles all 6 zones + ~50 more before 2nd needed.
+ *   Grid-aligned positions (offset ≡ 2 mod 4) for clean expansion.
  *
- * Starter City Layout (T-grid):
- *   Main road (east-west) at y=gy with wire for power
- *   Branch road (south) at x=gx with wire for power
- *   South cross-road at y=gy+8 connecting to power plant
- *   Residential zones: NORTH of main road (clean area)
- *   Commercial zone: center, NORTH of main road
- *   Industrial zone: SOUTH, east of branch (pollution contained)
- *   Coal power plant: south-east, adjacent to road+wire grid
+ * Power Strategy (math-driven):
+ *   1 coal = 57 zones. Handles Town → City → most of Capital.
+ *   2nd coal only when utilization > 80% (~45+ zones).
+ *   Nuclear only at 80+ zones when replacing 2+ coal plants.
+ *   Wire on roads creates road+power hybrid tiles (CONDBIT).
  *
- * Power Strategy:
- *   Wire on roads creates road+power hybrid tiles (CONDBIT)
- *   Power propagates: plant → road+wire → zone tiles (CONDBIT)
- *   All zones adjacent to wired roads get power automatically
- *
- * Key behaviors:
- *   - Maintains fund reserve (phase-dependent)
- *   - Adapts action speed to game speed
- *   - Always builds road+wire pairs for power connectivity
- *   - Strict zone district separation
+ * Zone Strategy (employment-driven):
+ *   employment = (comPop + indPop) / (resPop / 8)
+ *   < 0.8: build C/I (need jobs)
+ *   > 1.3: build R (need workers)
+ *   Balanced: follow valve demand
  */
 
 import $ from 'jquery';
@@ -175,21 +168,26 @@ AIHelper.prototype._updateStats = function() {
   var cBar = this._makeBar(valves.comValve);
   var iBar = this._makeBar(valves.indValve);
 
-  var powerZones = census.poweredZoneCount + census.unpoweredZoneCount;
-  var powerPct = powerZones > 0 ? Math.round(census.poweredZoneCount / powerZones * 100) : 100;
+  // Power utilization (math-based)
+  var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
+  var coalPlants = census.coalPowerPop;
+  var nuclearPlants = census.nuclearPowerPop;
+  var maxPower = coalPlants * 700 + nuclearPlants * 2000;
+  var estConsumption = totalZones * 12 + (coalPlants + nuclearPlants) * 16;
+  var powerUtil = maxPower > 0 ? Math.round(estConsumption / maxPower * 100) : 0;
+  var zonesLeft = maxPower > 0 ? Math.floor((maxPower - estConsumption) / 12) : 0;
 
-  var jobBase = (census.comPop + census.indPop) * 8;
-  var unemployment = 0;
-  if (jobBase > 0) {
-    unemployment = Math.max(0, Math.round((census.resPop / jobBase - 1) * 100));
-  }
+  // Employment balance
+  var normalizedResPop = census.resPop / 8;
+  var employment = normalizedResPop > 0 ?
+    Math.round((census.comPop + census.indPop) / normalizedResPop * 100) : 100;
 
   var phase = this.advisor._getPhase();
 
   $('#aiStatsContent').html(
     '<div class="ai-stat">Phase: ' + phase + ' | Demand: R' + rBar + ' C' + cBar + ' I' + iBar + '</div>' +
-    '<div class="ai-stat">Power: ' + powerPct + '% | Crime: ' + (census.crimeAverage || 0) + '</div>' +
-    '<div class="ai-stat">Traffic: ' + Math.round(census.trafficAverage || 0) + ' | Unemp: ' + unemployment + '%</div>' +
+    '<div class="ai-stat">Power: ' + powerUtil + '% (' + zonesLeft + ' zones left) | Zones: ' + totalZones + '</div>' +
+    '<div class="ai-stat">Employment: ' + employment + '% | Crime: ' + (census.crimeAverage || 0) + '</div>' +
     '<div class="ai-stat">Score: ' + eval_.cityScore + ' | $' + budget.totalFunds + ' (flow: $' + budget.cashFlow + ')</div>'
   );
 };
@@ -347,10 +345,15 @@ AIHelper.prototype._wireAdjacentRoads = function(x, y, size) {
 
 
 // ---- Starter City: Optimal T-Grid Layout ----
+//
+// Math: 1 coal ($3000) + 3R+1C+2I ($600) + roads/wire (~$600) = ~$4200
+// R:(C+I) = 3:3 = 1:1 → balanced employment from the start.
+// 1 coal plant (700 capacity) handles all 6 zones + 50 more before 2nd needed.
+// Grid-aligned positions (offset ≡ 2 mod 4) so expansion zones mesh perfectly.
 
 AIHelper.prototype._buildStarterCity = function() {
   var budget = this.simulation.budget;
-  if (budget.totalFunds < 4000) return false;
+  if (budget.totalFunds < 4500) return false;
 
   var origin = this.advisor.findStarterLocation();
   if (!origin) return false;
@@ -361,14 +364,13 @@ AIHelper.prototype._buildStarterCity = function() {
   // Store grid plan
   this.advisor.initCityPlan(gx, gy);
 
-  // === Step 1: Coal power plant (south-east, near future industrial area) ===
-  // doTool(gx+4, gy+9) → occupies (gx+3, gy+8) to (gx+6, gy+11)
-  // Plant tile at (gx+3, gy+8) will be adjacent to road at (gx+2, gy+8)
+  // === Step 1: Coal power plant ($3000) ===
+  // 700 capacity = ~57 zones. This one plant handles Town → City → most of Capital.
+  // South-east, adjacent to industrial area.
   var coalTool = this.tools.coal;
   coalTool.doTool(gx + 4, gy + 9, this.blockMaps);
   if (coalTool.result !== coalTool.TOOLRESULT_OK) {
     coalTool.clear();
-    // Try alternate position
     coalTool.doTool(gx - 4, gy + 9, this.blockMaps);
     if (coalTool.result !== coalTool.TOOLRESULT_OK) {
       coalTool.clear();
@@ -378,43 +380,35 @@ AIHelper.prototype._buildStarterCity = function() {
   coalTool.modifyIfEnoughFunding(budget);
   if (coalTool.result === coalTool.TOOLRESULT_NO_MONEY) return false;
 
-  // === Step 2: Main horizontal road at y=gy (the city spine) ===
-  // 13 tiles from gx-6 to gx+6, with wire on each for power
-  var rx;
-  for (rx = gx - 6; rx <= gx + 6; rx++) {
+  // === Step 2: Main horizontal road at y=gy (city spine) ===
+  // 15 tiles from gx-7 to gx+7, with wire for power propagation
+  var rx, ry;
+  for (rx = gx - 7; rx <= gx + 7; rx++) {
     this._buildRoadWithWire(rx, gy);
   }
 
   // === Step 3: Branch road south at x=gx (industrial access) ===
-  // 8 tiles from gy+1 to gy+8, with wire
-  var ry;
   for (ry = gy + 1; ry <= gy + 8; ry++) {
     this._buildRoadWithWire(gx, ry);
   }
 
-  // === Step 4: South cross-road at y=gy+8 (power plant connection) ===
-  // 4 tiles from gx-2 to gx+2, excluding gx (already has road)
-  for (rx = gx - 2; rx <= gx + 2; rx++) {
+  // === Step 4: South cross-road at y=gy+8 (plant connection) ===
+  for (rx = gx - 3; rx <= gx + 3; rx++) {
     if (rx !== gx) {
       this._buildRoadWithWire(rx, gy + 8);
     }
   }
 
-  // === Step 5: Residential zones (NORTH of main road - clean area) ===
-  // Zone at (gx-4, gy-2): occupies (gx-5,gy-3) to (gx-3,gy-1)
-  // South perimeter touches main road at gy → road access ✓
-  // Zone tiles have CONDBIT → power from adjacent road+wire ✓
+  // === Step 5: Residential zones NORTH (3 zones, grid-aligned) ===
+  // Grid-aligned: offset ≡ 2 (mod 4) from grid origin
+  // Zone at (gx-2, gy-2): occupies (gx-3,gy-3)→(gx-1,gy-1), adjacent to road at gy ✓
+  // Zone at (gx+2, gy-2): occupies (gx+1,gy-3)→(gx+3,gy-1), adjacent to road at gy ✓
+  // Zone at (gx+6, gy-2): occupies (gx+5,gy-3)→(gx+7,gy-1), adjacent to road at gy ✓
   var resTool = this.tools.residential;
-  resTool.doTool(gx - 4, gy - 2, this.blockMaps);
-  if (resTool.result === resTool.TOOLRESULT_OK) {
-    resTool.modifyIfEnoughFunding(budget);
-  } else {
-    resTool.clear();
-  }
-
-  // Second residential zone (east side)
-  if (budget.totalFunds >= 600) {
-    resTool.doTool(gx + 4, gy - 2, this.blockMaps);
+  var resPositions = [[gx - 2, gy - 2], [gx + 2, gy - 2], [gx + 6, gy - 2]];
+  for (var i = 0; i < resPositions.length; i++) {
+    if (budget.totalFunds < 600) break;
+    resTool.doTool(resPositions[i][0], resPositions[i][1], this.blockMaps);
     if (resTool.result === resTool.TOOLRESULT_OK) {
       resTool.modifyIfEnoughFunding(budget);
     } else {
@@ -422,10 +416,11 @@ AIHelper.prototype._buildStarterCity = function() {
     }
   }
 
-  // === Step 6: Commercial zone (center, north of main road) ===
+  // === Step 6: Commercial zone (1 zone, near junction) ===
+  // At (gx-6, gy-2): west end of main road, grid-aligned
   if (budget.totalFunds >= 600) {
     var comTool = this.tools.commercial;
-    comTool.doTool(gx, gy - 2, this.blockMaps);
+    comTool.doTool(gx - 6, gy - 2, this.blockMaps);
     if (comTool.result === comTool.TOOLRESULT_OK) {
       comTool.modifyIfEnoughFunding(budget);
     } else {
@@ -433,14 +428,14 @@ AIHelper.prototype._buildStarterCity = function() {
     }
   }
 
-  // === Step 7: Industrial zone (SOUTH area, east of branch road) ===
-  // Zone at (gx+2, gy+6): occupies (gx+1,gy+5) to (gx+3,gy+7)
-  // West perimeter at x=gx touches branch road → road access ✓
-  // Distance from residential (gx-4,gy-2): ~14 tiles → separation ✓
-  // Distance from residential (gx+4,gy-2): ~10 tiles → separation ✓
-  if (budget.totalFunds >= 600) {
-    var indTool = this.tools.industrial;
-    indTool.doTool(gx + 2, gy + 6, this.blockMaps);
+  // === Step 7: Industrial zones SOUTH (2 zones, flanking branch) ===
+  // At (gx+2, gy+6) and (gx-2, gy+6): grid-aligned, adjacent to branch road
+  // Distance from residential: ~8 tiles vertically → good separation
+  var indTool = this.tools.industrial;
+  var indPositions = [[gx + 2, gy + 6], [gx - 2, gy + 6]];
+  for (var i = 0; i < indPositions.length; i++) {
+    if (budget.totalFunds < 600) break;
+    indTool.doTool(indPositions[i][0], indPositions[i][1], this.blockMaps);
     if (indTool.result === indTool.TOOLRESULT_OK) {
       indTool.modifyIfEnoughFunding(budget);
     } else {
@@ -448,7 +443,7 @@ AIHelper.prototype._buildStarterCity = function() {
     }
   }
 
-  // === Step 8: Set optimal starting tax rate ===
+  // === Step 8: Optimal starting tax (7% = neutral in tax table) ===
   this.simulation.budget.setTax(7);
 
   return true;

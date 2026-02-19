@@ -6,20 +6,34 @@
  *   - Industrial: SOUTH of main road (pollution contained)
  *   - Power plant: South-east, near industrial
  *
- * Phased growth:
- *   - Bootstrap: Build optimal starter city layout
- *   - Early: Wait for positive cash flow, build sparingly
- *   - Growth: Expand grid systematically following demand
- *   - Metro: Optimize score, add special buildings
+ * Power math (work backwards from need):
+ *   - Coal: 700 capacity = ~57 zones @ 12 tiles/zone, costs $3000
+ *   - Nuclear: 2000 capacity = ~165 zones, costs $5000
+ *   - Each zone ~12 power tiles (9 zone tiles + ~3 road/wire overhead)
+ *   - 1 coal handles Town, City, and most of Capital
+ *   - 2nd coal only when utilization > 80% (~45+ zones)
+ *   - Nuclear only replaces 2+ coal at 80+ zones ($5k < 2×$3k)
+ *
+ * Employment balance (drives zone building):
+ *   - employment = (comPop + indPop) / (resPop / 8)
+ *   - Target range: 0.8 to 1.3
+ *   - R:(C+I) ≈ 1:1 in zone count for balance
+ *   - Below 0.8: prioritize C/I (need jobs)
+ *   - Above 1.3: prioritize R (need workers)
+ *   - Balanced: follow demand valves as tiebreaker
+ *
+ * Progression targets:
+ *   - Starter: 1 coal + 3R+1C+2I = ~$4500 of $20k budget
+ *   - Town (2k pop): ~10 developed zones, 1 coal
+ *   - City (10k pop): ~25 zones, 1 coal
+ *   - Capital (50k pop): ~70 zones, 2 coal
+ *   - Metropolis (100k+): 120+ zones, nuclear upgrade
  *
  * Key mechanics:
- *   - Score: power ratio, zone caps (0.85x), crime, tax, unemployment
  *   - Revenue: floor(totalPop * landValueAvg / 120) * cityTax * FLevels
  *   - Traffic: MAX_TRAFFIC_DISTANCE = 30 tiles residential to jobs
- *   - Power: Propagates through CONDBIT tiles (wire, road+wire hybrids, zone tiles)
- *   - Zone tiles have CONDBIT (BNCNBIT = BURNBIT | CONDBIT)
+ *   - Power: Propagates through CONDBIT tiles (wire, road+wire, zone tiles)
  *   - Zone growth: road access + power + pollution < 128 for residential
- *   - Unemployment: resPop / ((comPop + indPop) * 8) - 1
  */
 
 import * as TileValues from './tileValues.ts';
@@ -44,6 +58,18 @@ var COMFORTABLE_FUNDS = 2000;
 var GRID_SPACING = 4;
 var DISTRICT_RADIUS = 6;
 
+// Power math constants
+var COAL_CAPACITY = 700;
+var NUCLEAR_CAPACITY = 2000;
+var TILES_PER_ZONE = 12;      // 9 zone tiles + ~3 shared road/wire
+var PLANT_OVERHEAD = 16;       // 4x4 plant footprint
+var POWER_BUILD_THRESHOLD = 0.80;
+
+// Employment balance targets
+var EMPLOYMENT_LOW = 0.8;      // Below: need more C/I jobs
+var EMPLOYMENT_HIGH = 1.3;     // Above: need more R residents
+var NUCLEAR_MIN_ZONES = 80;    // Don't build nuclear below this
+
 function AIAdvisor(simulation, gameMap, blockMaps) {
   this.simulation = simulation;
   this.map = gameMap;
@@ -60,10 +86,11 @@ function AIAdvisor(simulation, gameMap, blockMaps) {
 // ---- City plan management ----
 
 AIAdvisor.prototype._getPhase = function() {
-  var pop = this.simulation._census.totalPop;
-  if (pop === 0) return 'bootstrap';
-  if (pop < 50) return 'early';
-  if (pop < 500) return 'growth';
+  var census = this.simulation._census;
+  var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
+  if (totalZones === 0) return 'bootstrap';
+  if (census.totalPop < 50) return 'early';
+  if (census.totalPop < 500) return 'growth';
   return 'metro';
 };
 
@@ -79,22 +106,23 @@ AIAdvisor.prototype.findStarterLocation = function() {
   var cx = this.map.cityCentreX;
   var cy = this.map.cityCentreY;
 
-  // Need area for T-grid: 13 wide x 15 tall
-  // Layout: (gx-6, gy-3) to (gx+6, gy+11)
+  // Need area for T-grid: 15 wide x 15 tall
+  // Wider to fit grid-aligned zones at gx-6, gx-2, gx+2, gx+6
+  // Layout: (gx-7, gy-3) to (gx+7, gy+11)
   for (var r = 0; r < 40; r++) {
     for (var dy = -r; dy <= r; dy++) {
       for (var dx = -r; dx <= r; dx++) {
         if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
         var gx = cx + dx;
         var gy = cy + dy;
-        if (this._isAreaClear(gx - 6, gy - 3, 13, 15)) {
+        if (this._isAreaClear(gx - 7, gy - 3, 15, 15)) {
           return { x: gx, y: gy };
         }
       }
     }
   }
 
-  // Fallback: smaller area (plant placed separately)
+  // Fallback: smaller area
   for (var r = 0; r < 40; r++) {
     for (var dy = -r; dy <= r; dy++) {
       for (var dx = -r; dx <= r; dx++) {
@@ -274,49 +302,75 @@ AIAdvisor.prototype._analyzeBudgetActions = function(budget, census) {
 };
 
 
-// ---- Power analysis ----
+// ---- Power analysis (math-based) ----
+//
+// Coal: 700 capacity handles ~57 zones. One plant is enough until ~45 zones.
+// Nuclear: 2000 capacity handles ~165 zones. Only cost-effective at 80+ zones.
+// Never build power reactively to unpowered zones - calculate actual capacity.
 
 AIAdvisor.prototype._analyzePower = function(census, budget) {
   var recs = [];
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
-  var powerPop = census.coalPowerPop + census.nuclearPowerPop;
+  var coalPlants = census.coalPowerPop;
+  var nuclearPlants = census.nuclearPowerPop;
+  var maxPower = coalPlants * COAL_CAPACITY + nuclearPlants * NUCLEAR_CAPACITY;
 
-  if (totalZones > 0 && powerPop === 0) {
+  // No zones yet - no power needed
+  if (totalZones === 0) return recs;
+
+  // No power at all - need first coal plant
+  if (maxPower === 0) {
     if (budget.totalFunds >= 3000 + MIN_RESERVE) {
       recs.push({
         priority: PRIORITIES.POWER + 10,
-        message: 'CRITICAL: No power plants! Building coal power plant ($3000).',
+        message: 'No power! Building coal plant ($3000). Handles ~57 zones.',
         action: { type: 'build', tool: 'coal' }
       });
     } else {
       recs.push({
         priority: PRIORITIES.POWER + 10,
-        message: 'CRITICAL: No power! Saving for coal plant ($3000). Have: $' + budget.totalFunds
+        message: 'Need coal plant ($3000). Have: $' + budget.totalFunds
       });
     }
-  } else if (totalZones > 0 && census.unpoweredZoneCount > totalZones * 0.3) {
-    if (budget.totalFunds >= 5000 + COMFORTABLE_FUNDS) {
+    return recs;
+  }
+
+  // Calculate actual power utilization
+  var estConsumption = totalZones * TILES_PER_ZONE +
+    (coalPlants + nuclearPlants) * PLANT_OVERHEAD;
+  var utilization = estConsumption / maxPower;
+  var zonesUntilFull = Math.floor((maxPower - estConsumption) / TILES_PER_ZONE);
+
+  // Only build new plant when utilization exceeds threshold
+  if (utilization > POWER_BUILD_THRESHOLD || zonesUntilFull < 8) {
+    // Nuclear only when: already have 2+ coal AND large city AND cheaper than 3rd coal
+    if (coalPlants >= 2 && nuclearPlants === 0 &&
+        totalZones >= NUCLEAR_MIN_ZONES &&
+        budget.totalFunds >= 5000 + COMFORTABLE_FUNDS) {
       recs.push({
         priority: PRIORITIES.POWER + 5,
-        message: 'Many zones unpowered (score penalty!). Building nuclear plant.',
+        message: 'Power ' + Math.round(utilization * 100) + '% (' +
+          zonesUntilFull + ' zones left). Nuclear upgrade for ' + totalZones + ' zones.',
         action: { type: 'build', tool: 'nuclear' }
       });
     } else if (budget.totalFunds >= 3000 + MIN_RESERVE) {
       recs.push({
         priority: PRIORITIES.POWER + 5,
-        message: 'Many zones unpowered (score penalty!). Building coal plant.',
+        message: 'Power ' + Math.round(utilization * 100) + '% (' +
+          zonesUntilFull + ' zones left). Building 2nd coal plant.',
         action: { type: 'build', tool: 'coal' }
       });
     } else {
       recs.push({
         priority: PRIORITIES.POWER,
-        message: 'Zones need power but funds too low. Saving for coal plant ($3000).'
+        message: 'Power running low (' + zonesUntilFull + ' zones left). Saving for plant.'
       });
     }
-  } else if (totalZones > 0 && census.unpoweredZoneCount > 0) {
+  } else if (census.unpoweredZoneCount > 0) {
+    // Have capacity but zones aren't connected - wiring issue, not capacity
     recs.push({
       priority: PRIORITIES.WIRE_CONNECT,
-      message: census.unpoweredZoneCount + ' zones need power lines ($5 each).',
+      message: census.unpoweredZoneCount + ' zones need power lines (have capacity).',
       action: { type: 'wire_connect' }
     });
   }
@@ -325,38 +379,37 @@ AIAdvisor.prototype._analyzePower = function(census, budget) {
 };
 
 
-// ---- Zone demand (phase-aware) ----
+// ---- Zone demand (employment-ratio driven) ----
+//
+// Core strategy: maintain R:(C+I) ≈ 1:1 for employment balance.
+// employment = (comPop + indPop) / (resPop / 8)
+// - Below 0.8: not enough jobs → build C/I
+// - Above 1.3: excess jobs → build R
+// - 0.8-1.3: balanced → follow valve demand with ratio guard
+// Don't build zones if power can't handle them.
 
 AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   var recs = [];
-  var totalZonePop = census.resZonePop + census.comZonePop + census.indZonePop;
+  var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
   var phase = this._getPhase();
 
   // Bootstrap: build starter city
-  if (totalZonePop === 0 && budget.totalFunds >= 4000) {
+  if (totalZones === 0 && census.totalPop === 0 && budget.totalFunds >= 4500) {
     recs.push({
       priority: PRIORITIES.ZONE_DEMAND + 15,
-      message: 'Building optimal starter city with grid layout and power.',
+      message: 'Building starter city: 1 coal + 3R+1C+2I (~$4500).',
       action: { type: 'build_starter' }
     });
     return recs;
   }
 
-  // Early phase: don't build until cash flow is positive
+  // Early phase: wait for positive cash flow before expanding
   if (phase === 'early' && budget.cashFlow < 0) {
     recs.push({
       priority: PRIORITIES.BUDGET_INFO,
-      message: 'Early phase: waiting for positive cash flow ($' + budget.cashFlow + '/yr) before expanding.'
+      message: 'Waiting for positive cash flow ($' + budget.cashFlow + '/yr).'
     });
     return recs;
-  }
-
-  // Calculate unemployment
-  var jobBase = (census.comPop + census.indPop) * 8;
-  var unemployment = 0;
-  if (jobBase > 0) {
-    unemployment = Math.round((census.resPop / jobBase - 1) * 255);
-    unemployment = Math.max(0, Math.min(unemployment, 255));
   }
 
   // Phase-dependent reserve
@@ -369,82 +422,123 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
     if (valves.resValve > 500 || valves.comValve > 500 || valves.indValve > 500) {
       recs.push({
         priority: PRIORITIES.ZONE_DEMAND - 5,
-        message: 'Demand exists but keeping reserve ($' + budget.totalFunds + '). Waiting for revenue.'
+        message: 'Demand exists but keeping reserve ($' + budget.totalFunds + ').'
       });
     }
     return recs;
   }
 
-  // High unemployment: prioritize jobs
-  if (unemployment > 100 && (valves.comValve > 0 || valves.indValve > 0)) {
+  // Don't build zones if power can't handle more
+  var maxPower = census.coalPowerPop * COAL_CAPACITY + census.nuclearPowerPop * NUCLEAR_CAPACITY;
+  var estConsumption = totalZones * TILES_PER_ZONE +
+    (census.coalPowerPop + census.nuclearPowerPop) * PLANT_OVERHEAD;
+  if (maxPower > 0 && estConsumption > maxPower * 0.90) {
     recs.push({
-      priority: PRIORITIES.ZONE_DEMAND + 12,
-      message: 'High unemployment (' + unemployment + '). Prioritizing job-creating zones.',
-      action: { type: 'build', tool: valves.comValve >= valves.indValve ? 'commercial' : 'industrial' }
+      priority: PRIORITIES.ZONE_DEMAND - 10,
+      message: 'Power near capacity (' + Math.round(estConsumption / maxPower * 100) +
+        '%). Build power plant before adding zones.'
     });
     return recs;
   }
 
-  // Follow RCI demand valves - check if zone locations exist first
-  if (valves.resValve > 100) {
-    var urgency = Math.min(valves.resValve / 2000 * 20, 20);
-    var resLoc = this.findBestZoneLocation('residential');
-    if (resLoc && resLoc.score > -100) {
+  // Calculate employment balance (same formula as valve engine)
+  var normalizedResPop = census.resPop / 8;
+  var employment = 1;
+  if (normalizedResPop > 0) {
+    employment = (census.comPop + census.indPop) / normalizedResPop;
+  }
+
+  // PRIORITY 1: Fix severe employment imbalance
+  if (employment < EMPLOYMENT_LOW && normalizedResPop > 2) {
+    // Not enough jobs - build C or I
+    var tool = valves.indValve >= valves.comValve ? 'industrial' : 'commercial';
+    var loc = this.findBestZoneLocation(tool);
+    if (loc && loc.score > -100) {
       recs.push({
-        priority: PRIORITIES.ZONE_DEMAND + urgency,
-        message: 'Residential demand: ' + Math.round(valves.resValve / 20) + '%',
+        priority: PRIORITIES.ZONE_DEMAND + 15,
+        message: 'Employment low (' + Math.round(employment * 100) +
+          '%). Building ' + tool + ' for jobs.',
+        action: { type: 'build', tool: tool }
+      });
+    } else {
+      recs.push({
+        priority: PRIORITIES.ROAD_CONNECT + 5,
+        message: 'Need ' + tool + ' space. Expanding grid.',
+        action: { type: 'expand_grid', zoneType: tool }
+      });
+    }
+    return recs;
+  }
+
+  // PRIORITY 2: Excess jobs - need more residents
+  if (employment > EMPLOYMENT_HIGH || (normalizedResPop < 2 && valves.resValve > 0)) {
+    var loc = this.findBestZoneLocation('residential');
+    if (loc && loc.score > -100) {
+      recs.push({
+        priority: PRIORITIES.ZONE_DEMAND + 12,
+        message: (normalizedResPop < 2 ? 'Need residents for tax base.' :
+          'Excess jobs (emp ' + Math.round(employment * 100) + '%).') +
+          ' Building residential.',
         action: { type: 'build', tool: 'residential' }
       });
     } else {
-      // No valid residential spot - need to expand grid north
       recs.push({
         priority: PRIORITIES.ROAD_CONNECT + 5,
-        message: 'Need more residential space. Expanding grid north.',
+        message: 'Need residential space. Expanding grid.',
         action: { type: 'expand_grid', zoneType: 'residential' }
       });
     }
+    return recs;
   }
 
+  // PRIORITY 3: Employment balanced - follow valve demand with ratio awareness
+  var buildChoices = [];
+
+  if (valves.resValve > 100) {
+    buildChoices.push({ tool: 'residential', priority: valves.resValve / 100 });
+  }
   if (valves.comValve > 100) {
-    var urgency = Math.min(valves.comValve / 1500 * 15, 15);
-    recs.push({
-      priority: PRIORITIES.ZONE_DEMAND + urgency,
-      message: 'Commercial demand: ' + Math.round(valves.comValve / 15) + '%',
-      action: { type: 'build', tool: 'commercial' }
-    });
+    buildChoices.push({ tool: 'commercial', priority: valves.comValve / 75 });
+  }
+  if (valves.indValve > 100) {
+    buildChoices.push({ tool: 'industrial', priority: valves.indValve / 75 });
   }
 
-  if (valves.indValve > 100) {
-    var urgency = Math.min(valves.indValve / 1500 * 15, 15);
-    var indLoc = this.findBestZoneLocation('industrial');
-    if (indLoc && indLoc.score > -100) {
+  buildChoices.sort(function(a, b) { return b.priority - a.priority; });
+
+  for (var i = 0; i < buildChoices.length; i++) {
+    var choice = buildChoices[i];
+    var loc = this.findBestZoneLocation(choice.tool);
+    if (loc && loc.score > -100) {
       recs.push({
-        priority: PRIORITIES.ZONE_DEMAND + urgency,
-        message: 'Industrial demand: ' + Math.round(valves.indValve / 15) + '%',
-        action: { type: 'build', tool: 'industrial' }
+        priority: PRIORITIES.ZONE_DEMAND + Math.min(Math.round(choice.priority), 20),
+        message: 'Building ' + choice.tool + ' (emp: ' +
+          Math.round(employment * 100) + '%, zones: ' + totalZones + ').',
+        action: { type: 'build', tool: choice.tool }
       });
-    } else {
-      // No valid industrial spot - need to expand grid south
+      break; // Only one zone per action cycle
+    } else if (choice.tool === 'residential' || choice.tool === 'industrial') {
       recs.push({
         priority: PRIORITIES.ROAD_CONNECT + 5,
-        message: 'Need more industrial space. Expanding grid south.',
-        action: { type: 'expand_grid', zoneType: 'industrial' }
+        message: 'Expanding grid for ' + choice.tool + '.',
+        action: { type: 'expand_grid', zoneType: choice.tool }
       });
+      break;
     }
   }
 
   // Oversupply warnings
   if (valves.resValve < -1000) {
     recs.push({ priority: PRIORITIES.BUDGET_INFO - 5,
-      message: 'Residential oversupply (score -15%). Need more jobs.' });
+      message: 'Residential oversupply. Need more jobs.' });
   }
   if (valves.comValve < -1000) {
     recs.push({ priority: PRIORITIES.BUDGET_INFO - 5,
-      message: 'Commercial oversupply (score -15%). Need more residents.' });
+      message: 'Commercial oversupply. Need more residents.' });
   }
   if (valves.indValve < -1000) {
     recs.push({ priority: PRIORITIES.BUDGET_INFO - 5,
-      message: 'Industrial oversupply (score -15%). Need more residents.' });
+      message: 'Industrial oversupply. Need more residents.' });
   }
 
   return recs;
