@@ -887,9 +887,8 @@ AIHelper.prototype._buildZone = function(toolName) {
 
   // Pre-check: is there a connected road nearby that we can reach?
   // If not, don't waste money on a zone that will be stranded.
-  if (size <= 3 && !this.advisor._hasNearbyConnectedRoad(loc.x, loc.y, 10) &&
-      !this.advisor._hasNearbyRoad(loc.x, loc.y, 3)) {
-    // No connected road within reach — skip this location
+  // CRITICAL: Only check CONNECTED roads — disconnected fragments don't count.
+  if (size <= 3 && !this.advisor._hasNearbyConnectedRoad(loc.x, loc.y, 10)) {
     return false;
   }
 
@@ -897,16 +896,26 @@ AIHelper.prototype._buildZone = function(toolName) {
   if (tool.result === tool.TOOLRESULT_OK) {
     tool.modifyIfEnoughFunding(budget);
     if (tool.result !== tool.TOOLRESULT_NO_MONEY) {
-      // Ensure road access — now builds toward CONNECTED network
+      // Ensure road access — builds toward CONNECTED network
       var roadOk = this._ensureRoadAccess(loc.x, loc.y, size);
       // Wire the MINIMUM path to connect this zone to the power grid
       this._ensurePowerAccess(loc.x, loc.y, size);
 
       if (!roadOk) {
         // Road connection failed — zone will be stranded.
-        // Infrastructure audit will try to fix it later.
-        // Don't count as success so AI doesn't keep doing this.
-        return false;
+        // Rebuild network map to check if road building connected us anyway
+        this.advisor._buildRoadNetworkMap();
+        if (!this.advisor._hasAdjacentConnectedRoad(loc.x, loc.y)) {
+          // Truly failed — bulldoze the zombie zone to free the land
+          var bulldozerTool = this.tools.bulldozer;
+          bulldozerTool.doTool(loc.x, loc.y, this.blockMaps);
+          if (bulldozerTool.result === bulldozerTool.TOOLRESULT_OK) {
+            bulldozerTool.modifyIfEnoughFunding(budget);
+          } else {
+            bulldozerTool.clear();
+          }
+          return false;
+        }
       }
       return true;
     }
@@ -943,25 +952,19 @@ AIHelper.prototype._buildRoadConnection = function() {
     var maxRoads = 15;
     var pathSuccess = false;
 
+    // Build WIRED roads ($15/tile) for the connection path.
+    // OLD: Plain roads ($10) + wire only the connection point.
+    // NEW: Wired roads carry power along the entire path, preventing
+    // the cascading "zone has road but no power" failures.
     for (var i = 0; i < Math.min(pathOrLoc.length, maxRoads); i++) {
-      if (budget.totalFunds < 10) break;
+      if (budget.totalFunds < 15) break;
       var pos = pathOrLoc[i];
-      if (this._buildRoad(pos.x, pos.y)) {
+      if (this._buildRoadWithWire(pos.x, pos.y)) {
         pathSuccess = true;
       }
     }
 
-    // After building the road path, wire the connection point so
-    // power can flow through to the zone.
-    if (pathSuccess && pathOrLoc.length > 0) {
-      var lastPos = pathOrLoc[Math.min(pathOrLoc.length - 1, maxRoads - 1)];
-      // Wire the road tiles near the power grid connection
-      var nearCond = this._findNearestConductive(lastPos.x, lastPos.y, 5);
-      if (nearCond) {
-        this._wireOnly(lastPos.x, lastPos.y);
-        // Also wire a couple tiles toward the grid for better connectivity
-        this._wirePathBetween(lastPos.x, lastPos.y, nearCond.x, nearCond.y, 5);
-      }
+    if (pathSuccess) {
       success = true;
     }
   }
@@ -1011,8 +1014,11 @@ AIHelper.prototype._buildWireConnection = function() {
 
 
 // Expand the grid to create new zone slots.
-// Plain roads only ($10/tile) — wire added later when zones are actually placed.
-// This saves $5/tile on speculative roads that may not need power routing.
+// OLD: Plain roads ($10/tile) — zones placed near them had no power backbone.
+// NEW: Wired roads ($15/tile) — expansion roads carry power from the main
+// backbone so zones placed near them can get powered immediately.
+// The extra $5/tile prevents cascading power failures that require multiple
+// fix cycles and waste more money than the upfront wire cost.
 AIHelper.prototype._expandGrid = function(zoneType) {
   var roads = this.advisor.findGridExpansionRoads(zoneType);
   if (!roads || roads.length === 0) return false;
@@ -1021,9 +1027,9 @@ AIHelper.prototype._expandGrid = function(zoneType) {
   var success = false;
 
   for (var i = 0; i < roads.length; i++) {
-    if (budget.totalFunds < 510) break;
+    if (budget.totalFunds < 515) break;
     var pos = roads[i];
-    if (this._buildRoad(pos.x, pos.y)) {
+    if (this._buildRoadWithWire(pos.x, pos.y)) {
       success = true;
     }
   }
@@ -1121,21 +1127,23 @@ AIHelper.prototype._reducePollution = function() {
 };
 
 
-// Ensure road access for a zone — ACTUALLY connect to the road network.
+// Ensure road access for a zone — ACTUALLY connect to the CONNECTED road network.
 //
-// OLD: Built a 3-tile stub on the bottom edge. This created disconnected
-// road segments that didn't reach the existing network. Zones had a road
-// tile adjacent but couldn't route traffic → degraded anyway.
+// OLD: Checked _hasAdjacentRoad (ANY road including disconnected fragments)
+// and returned true. Zone appeared "connected" but couldn't route traffic.
 //
-// NEW: Find the nearest existing road in the network and build a PATH to it.
-// If no road exists within range, build a stub as fallback.
+// NEW: Only returns true if zone has a CONNECTED road adjacent.
+// If not, builds a road path to the nearest connected road in the network.
 AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
   var half = Math.floor(size / 2);
   var map = this.map;
   var budget = this.simulation.budget;
 
-  // Step 1: Check if zone already has road access via the network
-  if (this.advisor._hasAdjacentRoad(x, y)) return true;
+  // Step 1: Check if zone already has road access via the CONNECTED network.
+  // CRITICAL: _hasAdjacentConnectedRoad, NOT _hasAdjacentRoad.
+  // A disconnected road fragment next to the zone is NOT "road access" —
+  // traffic routing will fail and the zone will degrade.
+  if (this.advisor._hasAdjacentConnectedRoad(x, y)) return true;
 
   if (budget.totalFunds < 510) return false;
 
@@ -1333,7 +1341,13 @@ AIHelper.prototype._fixBrokenInfrastructure = function() {
     }
   }
 
-  // Pass 2: Fix zones without road access (build toward CONNECTED network)
+  // Rebuild road network map so we have fresh connectivity data
+  this.advisor._buildRoadNetworkMap();
+
+  // Pass 2: Fix zones without CONNECTED road access
+  // CRITICAL: Use _hasAdjacentConnectedRoad, not _hasAdjacentRoad.
+  // Zones with disconnected road fragments are just as broken as zones
+  // with no road at all — traffic can't route through disconnected roads.
   for (var y = 1; y < map.height - 1; y++) {
     for (var x = 1; x < map.width - 1; x++) {
       if (budget.totalFunds < 100) return fixed;
@@ -1341,9 +1355,9 @@ AIHelper.prototype._fixBrokenInfrastructure = function() {
       var tile = map.getTile(x, y);
       if (!tile.isZone()) continue;
 
-      // Check if this zone has any adjacent road (within 2 tiles for 3x3 zones)
-      if (!this.advisor._hasAdjacentRoad(x, y)) {
-        // Zone has NO road access — build a connection toward the real network
+      // Check if this zone has an adjacent CONNECTED road
+      if (!this.advisor._hasAdjacentConnectedRoad(x, y)) {
+        // Zone has no connected road — build toward the real network
         this._ensureRoadAccess(x, y, 3);
         fixed = true;
         continue; // Move to next zone

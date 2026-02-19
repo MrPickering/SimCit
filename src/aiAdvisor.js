@@ -324,7 +324,8 @@ AIAdvisor.prototype.findAbandonedZone = function() {
 
       var score = 0;
       var tv = map.getTileValue(x, y);
-      var hasRoad = this._hasAdjacentRoad(x, y);
+      var hasConnectedRoad = this._hasAdjacentConnectedRoad(x, y);
+      var hasAnyRoad = hasConnectedRoad || this._hasAdjacentRoad(x, y);
       var hasPower = tile.isPowered();
       var pollution = this._safeBlockGet(blockMaps.pollutionDensityMap, x, y);
 
@@ -333,13 +334,15 @@ AIAdvisor.prototype.findAbandonedZone = function() {
         score += 100;
       }
 
-      // No adjacent road — zone is disconnected, degrades immediately
-      if (!hasRoad) {
-        // Check if it's near the connected network (could be fixed)
+      // No adjacent CONNECTED road — zone can't route traffic, degrades immediately.
+      // A disconnected road fragment next to the zone is just as bad as no road.
+      if (!hasConnectedRoad) {
         if (!this._hasNearbyConnectedRoad(x, y, 8)) {
           score += 200; // Far from network — unreachable, must bulldoze
+        } else if (!hasAnyRoad) {
+          score += 150; // No road at all, but near network — could be fixed
         } else {
-          score += 50; // Near network — fixBrokenInfrastructure may save it
+          score += 100; // Has disconnected road fragment — still broken
         }
       }
 
@@ -1627,26 +1630,28 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
 
   // === INFRASTRUCTURE GATE ===
   // HARD RULE: Do NOT build new zones if existing zones are broken.
-  // The old AI kept building zones at priority 92-100 while wire_connect
-  // sat at priority 75, so unpowered zones piled up forever.
-  // Fix: count broken zones and REFUSE to build until they're fixed.
+  // Check BOTH power and road connectivity — zones need both to function.
+  // OLD: Only checked unpowered zones (missed zones with disconnected roads).
+  // NEW: Also count zones without CONNECTED road access.
   var unpowered = census.unpoweredZoneCount;
   var totalZoneCount = census.poweredZoneCount + unpowered;
-  if (unpowered > 2 && totalZoneCount > 6) {
-    // More than 2 unpowered zones = something is seriously wrong.
-    // Don't add MORE broken zones. Fix the existing ones first.
-    recs.push({
-      priority: PRIORITIES.WIRE_CONNECT + 5,
-      message: 'INFRASTRUCTURE HALT: ' + unpowered + ' unpowered zones. Fixing before building more.',
-      action: { type: 'wire_connect' }
-    });
-    // Also check if road connectivity is the root cause
-    var disconnected = this._countDisconnectedZones();
+  var disconnected = this._countDisconnectedZones(); // Uses _hasAdjacentConnectedRoad
+
+  if ((unpowered > 2 || disconnected > 1) && totalZoneCount > 6) {
+    // Broken zones exist — fix them before building more.
+    // Road disconnection is the ROOT CAUSE in most cases (no road → no power either).
     if (disconnected > 0) {
       recs.push({
         priority: PRIORITIES.ROAD_CONNECT + 5,
-        message: disconnected + ' zones without road access. Building connections.',
+        message: 'INFRA HALT: ' + disconnected + ' zones without connected road. Fixing first.',
         action: { type: 'build_roads' }
+      });
+    }
+    if (unpowered > 2) {
+      recs.push({
+        priority: PRIORITIES.WIRE_CONNECT + 5,
+        message: unpowered + ' unpowered zones. Connecting power.',
+        action: { type: 'wire_connect' }
       });
     }
     return recs; // STOP — no new zones until infrastructure is fixed
@@ -2720,9 +2725,17 @@ AIAdvisor.prototype.findRoadToConnect = function() {
     for (var x = 1; x < width - 1; x++) {
       var tile = map.getTile(x, y);
       if (!tile.isZone()) continue;
-      if (this._hasAdjacentRoad(x, y)) continue;
+      // Use CONNECTED road check — a disconnected fragment is not "connected"
+      if (this._hasAdjacentConnectedRoad(x, y)) continue;
 
-      var roadTarget = this._findNearestRoad(x, y);
+      // Build toward the CONNECTED network, not any random road fragment.
+      // Old code used _findNearestRoad which found disconnected fragments,
+      // creating MORE disconnected infrastructure.
+      var roadTarget = this._findNearestConnectedRoad(x, y);
+      if (!roadTarget) {
+        // No connected network yet — fall back to any road
+        roadTarget = this._findNearestRoad(x, y);
+      }
       if (roadTarget) {
         var path = this.findRoadPath(x, y, roadTarget.x, roadTarget.y);
         if (path.length > 0) return path;
@@ -3184,15 +3197,39 @@ AIAdvisor.prototype._hasAdjacentRoad = function(x, y) {
 };
 
 
-// Count zones that have NO adjacent road — these are completely broken
+// Check if zone has an adjacent road that's part of the CONNECTED network.
+// This is the critical distinction: _hasAdjacentRoad finds ANY road (including
+// disconnected fragments), but zones need roads connected to the MAIN network
+// to route traffic. Without a connected road, traffic check fails → zone degrades.
+AIAdvisor.prototype._hasAdjacentConnectedRoad = function(x, y) {
+  if (!this._connectedRoads) return false;
+  var map = this.map;
+  var checks = [[-1,0],[1,0],[0,-1],[0,1],[-2,0],[2,0],[0,-2],[0,2]];
+  for (var i = 0; i < checks.length; i++) {
+    var nx = x + checks[i][0];
+    var ny = y + checks[i][1];
+    if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
+      if (TileUtils.isRoad(map.getTileValue(nx, ny)) &&
+          this._connectedRoads[nx + ',' + ny]) {
+        return true;
+      }
+    }
+  }
+  return false;
+};
+
+
+// Count zones that have NO adjacent CONNECTED road — these are completely broken
 // and will fail every traffic check, degrading immediately.
+// Uses _hasAdjacentConnectedRoad instead of _hasAdjacentRoad so zones with
+// disconnected road fragments are correctly identified as broken.
 AIAdvisor.prototype._countDisconnectedZones = function() {
   var map = this.map;
   var count = 0;
   for (var y = 1; y < map.height - 1; y++) {
     for (var x = 1; x < map.width - 1; x++) {
       if (!map.getTile(x, y).isZone()) continue;
-      if (!this._hasAdjacentRoad(x, y)) count++;
+      if (!this._hasAdjacentConnectedRoad(x, y)) count++;
     }
   }
   return count;
