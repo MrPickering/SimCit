@@ -92,6 +92,9 @@ var F_LEVELS = [1.4, 1.2, 0.8];
 // Road maintenance multipliers by difficulty
 var R_LEVELS = [0.7, 0.9, 1.2];
 
+// External market competition multipliers from valves.js
+var EXT_MARKET_PARAM_TABLE = [1.2, 1.1, 0.98];
+
 function AIAdvisor(simulation, gameMap, blockMaps) {
   this.simulation = simulation;
   this.map = gameMap;
@@ -107,6 +110,16 @@ function AIAdvisor(simulation, gameMap, blockMaps) {
   this._lastTotalPop = 0;
   this._popGrowthRate = 0;
   this._ticksSinceSpecialCheck = 0;
+
+  // Closed-loop diagnostic state
+  this._stallCycles = 0;
+  this._lastActionType = null;
+  this._lastActionTime = 0;
+  this._lastZoneBuildType = null;
+  this._growthHistory = []; // Rolling window of pop deltas
+  this._lastValvePrediction = null;
+  this._lastScoreBreakdown = null;
+  this._lastStallDiagnosis = null;
 }
 
 
@@ -165,6 +178,431 @@ AIAdvisor.prototype._estimateGrowthProb = function(valve, locationScore) {
   if (zoneScore <= -350) return 0;
   return Math.max(0, (zoneScore + 6388) / 65536);
 };
+
+// ---- Closed-loop diagnostics: trend tracking ----
+//
+// Called every analyze() cycle to track population trends and detect stalls.
+// Growth stall detection triggers root-cause diagnosis so the AI can
+// identify and fix the SPECIFIC bottleneck instead of blindly building zones.
+
+AIAdvisor.prototype._updateTrends = function() {
+  var census = this.simulation._census;
+  var currentPop = census.totalPop;
+
+  // Calculate growth delta
+  if (this._lastTotalPop > 0) {
+    this._popGrowthRate = currentPop - this._lastTotalPop;
+  }
+  this._lastTotalPop = currentPop;
+
+  // Rolling growth history (last 10 samples)
+  this._growthHistory.push(this._popGrowthRate);
+  if (this._growthHistory.length > 10) this._growthHistory.shift();
+
+  // Stall detection: consecutive cycles with zero or negative growth
+  if (this._popGrowthRate <= 0 && currentPop > 50) {
+    this._stallCycles++;
+  } else {
+    this._stallCycles = 0;
+  }
+
+  this._ticksSinceSpecialCheck++;
+
+  // Refresh predictions periodically (every 3 cycles to avoid overhead)
+  if (this._ticksSinceSpecialCheck % 3 === 0) {
+    this._lastValvePrediction = this._predictValves();
+    this._lastScoreBreakdown = this._calculateScoreBreakdown();
+  }
+
+  // Trigger stall diagnosis when growth has stalled for 5+ cycles
+  if (this._stallCycles >= 5) {
+    this._lastStallDiagnosis = this._diagnoseGrowthStall();
+  } else {
+    this._lastStallDiagnosis = null;
+  }
+};
+
+
+// ---- Growth stall diagnosis ----
+//
+// When population growth stalls, identify the ROOT CAUSE.
+// The AI checks every possible bottleneck from source code knowledge:
+//   1. Demand caps (resPop>500/indPop>70/comPop>100 without special buildings)
+//   2. All valves negative (tax too high or employment imbalanced)
+//   3. Unpowered zones (commercial REQUIRES power to grow — line 126 commercial.js)
+//   4. Employment imbalance (uses LAGGED comHist10[1]+indHist10[1])
+//   5. Tax killing growth (valve effect < -50/cycle)
+//   6. Pollution blocking residential (hard block at >128)
+//   7. Crime destroying land value (>190 = landValue -20)
+//   8. Traffic routing failures (no path to complementary zones)
+//   9. Bankruptcy (can't build anything)
+//  10. Zone pacing (built too fast, waiting for development)
+//
+// Returns array sorted by severity (5=critical, 1=minor).
+
+AIAdvisor.prototype._diagnoseGrowthStall = function() {
+  var census = this.simulation._census;
+  var budget = this.simulation.budget;
+  var valves = this.simulation._valves;
+  var causes = [];
+
+  // 1. Demand caps — each costs 15% score AND blocks valve from going positive
+  if (valves.resCap) {
+    causes.push({cause: 'RES_CAP', severity: 5,
+      detail: 'Residential CAPPED (resPop ' + census.resPop + '/500). Stadium needed.',
+      fix: 'build_stadium'});
+  }
+  if (valves.indCap) {
+    causes.push({cause: 'IND_CAP', severity: 5,
+      detail: 'Industrial CAPPED (indPop ' + census.indPop + '/70). Seaport needed.',
+      fix: 'build_seaport'});
+  }
+  if (valves.comCap) {
+    causes.push({cause: 'COM_CAP', severity: 5,
+      detail: 'Commercial CAPPED (comPop ' + census.comPop + '/100). Airport needed.',
+      fix: 'build_airport'});
+  }
+
+  // 2. All valves negative → systemic demand problem
+  if (valves.resValve < 0 && valves.comValve < 0 && valves.indValve < 0) {
+    var taxEffect = this._getTaxValveEffect(budget.cityTax);
+    if (taxEffect < -30) {
+      causes.push({cause: 'TAX_KILLING_GROWTH', severity: 4,
+        detail: 'Tax ' + budget.cityTax + '% = ' + taxEffect + '/cycle valve penalty. All demand suppressed.',
+        fix: 'lower_tax'});
+    } else {
+      causes.push({cause: 'ALL_VALVES_NEGATIVE', severity: 3,
+        detail: 'R:' + valves.resValve + ' C:' + valves.comValve + ' I:' + valves.indValve + '. Employment or pacing issue.',
+        fix: 'rebalance'});
+    }
+  }
+
+  // 3. Unpowered zones — CRITICAL for commercial (requires power to grow, line 126 commercial.js)
+  var totalZones = census.unpoweredZoneCount + census.poweredZoneCount;
+  var unpoweredRatio = totalZones > 0 ? census.unpoweredZoneCount / totalZones : 0;
+  if (unpoweredRatio > 0.05 && census.unpoweredZoneCount > 1) {
+    causes.push({cause: 'POWER_DEFICIT', severity: 4,
+      detail: census.unpoweredZoneCount + ' unpowered zones (' + Math.round(unpoweredRatio * 100) + '%). Commercial CANNOT grow without power.',
+      fix: 'wire_connect'});
+  }
+
+  // 4. Employment imbalance — uses LAGGED data from comHist10[1]+indHist10[1]
+  var normalizedResPop = census.resPop / 8;
+  if (normalizedResPop > 2) {
+    var employment = (census.comPop + census.indPop) / normalizedResPop;
+    if (employment < 0.5) {
+      causes.push({cause: 'NO_JOBS', severity: 4,
+        detail: 'Employment ' + Math.round(employment * 100) + '% — need C/I zones for jobs.',
+        fix: 'build_jobs'});
+    } else if (employment > 2.0) {
+      causes.push({cause: 'NO_WORKERS', severity: 4,
+        detail: 'Employment ' + Math.round(employment * 100) + '% — need R zones for workers.',
+        fix: 'build_residential'});
+    }
+  }
+
+  // 5. Pollution blocking residential growth (hard block at >128 in residential.js:121)
+  if (census.pollutionAverage > 80) {
+    causes.push({cause: 'POLLUTION_BLOCK', severity: 3,
+      detail: 'Pollution avg ' + census.pollutionAverage + '. Residential blocks at 128. Move industry away.',
+      fix: 'reduce_pollution'});
+  }
+
+  // 6. Crime destroying land value (crime > 190 = landValue -20 in blockMapUtils)
+  if (census.crimeAverage > 120) {
+    causes.push({cause: 'CRIME_CRISIS', severity: 3,
+      detail: 'Crime avg ' + census.crimeAverage + '. Land value dropping → revenue dropping.',
+      fix: 'build_police'});
+  }
+
+  // 7. Traffic gridlock — zones degrade when traffic routing fails
+  if ((census.trafficAverage || 0) > 100) {
+    causes.push({cause: 'TRAFFIC_GRIDLOCK', severity: 3,
+      detail: 'Traffic avg ' + Math.round(census.trafficAverage) + '. Zones degrading from routing failures.',
+      fix: 'build_roads'});
+  }
+
+  // 8. Bankruptcy
+  if (budget.totalFunds < 500 && budget.cashFlow < 0) {
+    causes.push({cause: 'BROKE', severity: 4,
+      detail: 'Funds $' + budget.totalFunds + ', cash flow $' + budget.cashFlow + '/yr.',
+      fix: 'raise_tax'});
+  }
+
+  // 9. Road funding degradation — score penalty from evaluation.js
+  if (budget.roadEffect < Math.floor(budget.MAX_ROAD_EFFECT / 2) && census.roadTotal > 20) {
+    causes.push({cause: 'ROAD_DECAY', severity: 2,
+      detail: 'Road effect ' + budget.roadEffect + '/' + budget.MAX_ROAD_EFFECT + '. Score penalty active.',
+      fix: 'fund_roads'});
+  }
+
+  // 10. Valve trajectory heading negative — predict problems before they hit
+  var prediction = this._lastValvePrediction || this._predictValves();
+  if (prediction.resDelta < -100 && valves.resValve > 0 && prediction.resToZero !== null && prediction.resToZero < 5) {
+    causes.push({cause: 'RES_VALVE_CRASHING', severity: 2,
+      detail: 'Res valve ' + valves.resValve + ' dropping ' + prediction.resDelta + '/cycle. Hits 0 in ~' + prediction.resToZero + ' cycles.',
+      fix: 'build_jobs'});
+  }
+
+  causes.sort(function(a, b) { return b.severity - a.severity; });
+  return causes;
+};
+
+
+// ---- Valve trajectory prediction (exact valves.js formula) ----
+//
+// Replicates the EXACT setValves() calculation from valves.js to predict
+// what valve values will be on the next cycle. This lets the AI:
+//   - Anticipate demand changes before they happen
+//   - Pre-build zones before demand peaks
+//   - Avoid building into a collapsing valve
+//   - Predict how many cycles until a valve hits zero/cap
+
+AIAdvisor.prototype._predictValves = function() {
+  var census = this.simulation._census;
+  var budget = this.simulation.budget;
+  var gameLevel = this._getGameLevel();
+  var valves = this.simulation._valves;
+
+  var normalizedResPop = census.resPop / 8;
+
+  // Employment uses LAGGED historical data — this is key
+  var employment;
+  if (census.resPop > 0)
+    employment = (census.comHist10[1] + census.indHist10[1]) / normalizedResPop;
+  else
+    employment = 1;
+
+  var migration = normalizedResPop * (employment - 1);
+  var births = normalizedResPop * 0.02;
+  var projectedResPop = normalizedResPop + migration + births;
+
+  var labourBase = (census.comHist10[1] + census.indHist10[1]);
+  if (labourBase > 0)
+    labourBase = census.resHist10[1] / labourBase;
+  else
+    labourBase = 1;
+  labourBase = Math.max(0, Math.min(labourBase, 1.3));
+
+  var internalMarket = (normalizedResPop + census.comPop + census.indPop) / 3.7;
+  var projectedComPop = internalMarket * labourBase;
+  var projectedIndPop = census.indPop * labourBase * EXT_MARKET_PARAM_TABLE[gameLevel];
+  projectedIndPop = Math.max(projectedIndPop, 5.0);
+
+  var resRatio = normalizedResPop > 0 ? projectedResPop / normalizedResPop : 1.3;
+  var comRatio = census.comPop > 0 ? projectedComPop / census.comPop : projectedComPop;
+  var indRatio = census.indPop > 0 ? projectedIndPop / census.indPop : projectedIndPop;
+
+  resRatio = Math.min(resRatio, 2);
+  comRatio = Math.min(comRatio, 2);
+  indRatio = Math.min(indRatio, 2);
+
+  var z = Math.min(budget.cityTax + gameLevel, 20);
+  var resDelta = Math.round((resRatio - 1) * 600 + TAX_TABLE[z]);
+  var comDelta = Math.round((comRatio - 1) * 600 + TAX_TABLE[z]);
+  var indDelta = Math.round((indRatio - 1) * 600 + TAX_TABLE[z]);
+
+  var nextRes = Math.max(-2000, Math.min(2000, valves.resValve + resDelta));
+  var nextCom = Math.max(-1500, Math.min(1500, valves.comValve + comDelta));
+  var nextInd = Math.max(-1500, Math.min(1500, valves.indValve + indDelta));
+
+  if (valves.resCap && nextRes > 0) nextRes = 0;
+  if (valves.comCap && nextCom > 0) nextCom = 0;
+  if (valves.indCap && nextInd > 0) nextInd = 0;
+
+  return {
+    resDelta: resDelta, comDelta: comDelta, indDelta: indDelta,
+    nextRes: nextRes, nextCom: nextCom, nextInd: nextInd,
+    employment: employment,
+    laggedComInd: census.comHist10[1] + census.indHist10[1],
+    // Predict cycles until valve reaches zero (negative delta on positive valve)
+    resToZero: resDelta < 0 && valves.resValve > 0 ? Math.ceil(valves.resValve / Math.abs(resDelta)) : null,
+    comToZero: comDelta < 0 && valves.comValve > 0 ? Math.ceil(valves.comValve / Math.abs(comDelta)) : null,
+    indToZero: indDelta < 0 && valves.indValve > 0 ? Math.ceil(valves.indValve / Math.abs(indDelta)) : null
+  };
+};
+
+
+// ---- Score breakdown (exact evaluation.js decomposition) ----
+//
+// Calculates the EXACT contribution of each of the 7 problem categories
+// to identify the biggest score drains. Also computes multiplicative
+// penalties from demand caps and valve collapses.
+//
+// This lets the AI make targeted fixes instead of generic improvements:
+//   "Crime is costing 133 score points — build police" vs just "score is low"
+
+AIAdvisor.prototype._calculateScoreBreakdown = function() {
+  var census = this.simulation._census;
+  var budget = this.simulation.budget;
+  var valves = this.simulation._valves;
+  var blockMaps = this.blockMaps;
+
+  // Replicate traffic average calculation from evaluation.js:166
+  var trafficTotal = 0;
+  var trafficCount = 1;
+  var tdMap = blockMaps.trafficDensityMap;
+  var lvMap = blockMaps.landValueMap;
+  for (var x = 0; x < lvMap.gameMapWidth; x += lvMap.blockSize) {
+    for (var y = 0; y < lvMap.gameMapHeight; y += lvMap.blockSize) {
+      if (lvMap.worldGet(x, y) > 0) {
+        trafficTotal += tdMap.worldGet(x, y);
+        trafficCount++;
+      }
+    }
+  }
+  var trafficAvg = Math.floor(trafficTotal / trafficCount) * 2.4;
+
+  // Unemployment from evaluation.js:188
+  var b = (census.comPop + census.indPop) * 8;
+  var unemployment = 0;
+  if (b > 0) {
+    var r = census.resPop / b;
+    unemployment = Math.min(Math.max(Math.round((r - 1) * 255), 0), 255);
+  }
+
+  var fireSeverity = Math.min(census.firePop * 5, 255);
+
+  // Problem values (same as evaluation.js:208-214)
+  var problems = {
+    crime: census.crimeAverage,
+    pollution: census.pollutionAverage,
+    housing: Math.round(census.landValueAverage * 0.7),
+    taxes: budget.cityTax * 10,
+    traffic: Math.round(trafficAvg),
+    unemployment: unemployment,
+    fire: fireSeverity
+  };
+
+  var totalProblemValue = 0;
+  var problemScoreCosts = {};
+  for (var key in problems) {
+    totalProblemValue += problems[key];
+    // Each point contributes to: baseScore = (250 - min(sum/3, 250)) * 4
+    // Marginal cost ≈ value/3 * 4 = value * 1.333
+    problemScoreCosts[key] = Math.round(problems[key] * 1.333);
+  }
+
+  var baseScore = (250 - Math.min(Math.floor(totalProblemValue / 3), 250)) * 4;
+
+  // Multiplicative penalties
+  var multiplier = 1.0;
+  var penalties = [];
+  if (valves.resCap) { multiplier *= 0.85; penalties.push('resCap'); }
+  if (valves.comCap) { multiplier *= 0.85; penalties.push('comCap'); }
+  if (valves.indCap) { multiplier *= 0.85; penalties.push('indCap'); }
+  if (valves.resValve < -1000) { multiplier *= 0.85; penalties.push('resCollapse'); }
+  if (valves.comValve < -1000) { multiplier *= 0.85; penalties.push('comCollapse'); }
+  if (valves.indValve < -1000) { multiplier *= 0.85; penalties.push('indCollapse'); }
+
+  var totalZones = census.unpoweredZoneCount + census.poweredZoneCount;
+  var powerRatio = totalZones > 0 ? census.poweredZoneCount / totalZones : 1;
+
+  // Find biggest problem
+  var biggestProblem = '';
+  var biggestCost = 0;
+  for (key in problemScoreCosts) {
+    if (problemScoreCosts[key] > biggestCost) {
+      biggestCost = problemScoreCosts[key];
+      biggestProblem = key;
+    }
+  }
+
+  return {
+    problems: problems,
+    problemScoreCosts: problemScoreCosts,
+    baseScore: baseScore,
+    multiplier: multiplier,
+    penalties: penalties,
+    powerRatio: powerRatio,
+    fireSeverityPenalty: fireSeverity,
+    taxDirectPenalty: budget.cityTax,
+    estimatedScore: Math.round(baseScore * multiplier * powerRatio - fireSeverity - budget.cityTax),
+    biggestProblem: biggestProblem,
+    biggestProblemCost: biggestCost
+  };
+};
+
+
+// ---- Fund reservation system ----
+//
+// Predicts upcoming large expenses (special buildings, power plants) and
+// reserves funds so zone building doesn't drain the treasury right before
+// a critical purchase is needed. Without this, the AI would spend $4900
+// on zones and then not have $5000 for the stadium when resPop hits 500.
+
+AIAdvisor.prototype._shouldReserveFunds = function() {
+  var census = this.simulation._census;
+  var budget = this.simulation.budget;
+  var reservations = [];
+
+  // Stadium: reserve when resPop > 250 (well before 500 cap)
+  if (census.stadiumPop === 0 && census.resPop > 250) {
+    var resUrgency = census.resPop > 400 ? 'critical' : 'approaching';
+    reservations.push({building: 'stadium', cost: 5000, urgency: resUrgency});
+  }
+
+  // Seaport: reserve when indPop > 35 (well before 70 cap)
+  if (census.seaportPop === 0 && census.indPop > 35) {
+    var indUrgency = census.indPop > 55 ? 'critical' : 'approaching';
+    reservations.push({building: 'seaport', cost: 3000, urgency: indUrgency});
+  }
+
+  // Airport: reserve when comPop > 50 (well before 100 cap)
+  if (census.airportPop === 0 && census.comPop > 50) {
+    var comUrgency = census.comPop > 80 ? 'critical' : 'approaching';
+    reservations.push({building: 'airport', cost: 10000, urgency: comUrgency});
+  }
+
+  // Power plant: reserve when capacity > 70%
+  var maxPower = census.coalPowerPop * COAL_CAPACITY + census.nuclearPowerPop * NUCLEAR_CAPACITY;
+  var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
+  var estConsumption = totalZones * TILES_PER_ZONE + (census.coalPowerPop + census.nuclearPowerPop) * PLANT_OVERHEAD;
+  if (maxPower > 0 && estConsumption / maxPower > 0.70) {
+    var powerUrgency = estConsumption / maxPower > 0.85 ? 'critical' : 'approaching';
+    reservations.push({building: 'power plant', cost: 3000, urgency: powerUrgency});
+  }
+
+  // Sum critical reservations
+  var totalReserved = 0;
+  for (var i = 0; i < reservations.length; i++) {
+    if (reservations[i].urgency === 'critical') {
+      totalReserved += reservations[i].cost;
+    }
+  }
+
+  return {
+    reservations: reservations,
+    totalReserved: totalReserved,
+    canSpendOnZones: budget.totalFunds - totalReserved > 1000
+  };
+};
+
+
+// ---- Fund depletion prediction ----
+//
+// Projects when funds will hit zero at current income/expense rate.
+// Uses the EXACT budget.js formulas for revenue and maintenance.
+
+AIAdvisor.prototype._predictFundDepletion = function() {
+  var budget = this.simulation.budget;
+  var totalMaint = budget.roadMaintenanceBudget + budget.fireMaintenanceBudget + budget.policeMaintenanceBudget;
+  var revenue = this._projectRevenue(budget.cityTax);
+  var netFlow = revenue - totalMaint;
+
+  if (netFlow >= 0) return {cyclesUntilBroke: Infinity, netFlow: netFlow, revenue: revenue, maintenance: totalMaint};
+
+  // TAX_FREQUENCY = 48 cityTime, so each "tax cycle" we lose |netFlow|
+  var cyclesUntilBroke = Math.floor(budget.totalFunds / Math.abs(netFlow));
+
+  return {
+    cyclesUntilBroke: cyclesUntilBroke,
+    netFlow: netFlow,
+    revenue: revenue,
+    maintenance: totalMaint
+  };
+};
+
 
 // ---- City plan management ----
 
@@ -288,19 +726,62 @@ AIAdvisor.prototype.analyze = function() {
 
   this._ensurePlanInitialized();
 
+  // === CLOSED-LOOP: Update trends and predictions FIRST ===
+  this._updateTrends();
+
   // Budget adjustments are FREE - always check first
   var budgetActions = this._analyzeBudgetActions(budget, census);
   recommendations = recommendations.concat(budgetActions);
 
-  // Emergency mode
+  // Emergency mode — but check fund depletion prediction first
   var isEmergency = budget.totalFunds < MIN_RESERVE && census.totalPop > 0;
   if (isEmergency) {
+    var depletion = this._predictFundDepletion();
+    var depletionMsg = depletion.netFlow < 0 ?
+      ' Bankrupt in ~' + depletion.cyclesUntilBroke + ' tax cycles.' : '';
     recommendations.push({
       priority: PRIORITIES.EMERGENCY,
-      message: 'EMERGENCY: Funds at $' + budget.totalFunds + '. Halting construction.'
+      message: 'EMERGENCY: Funds at $' + budget.totalFunds + '.' + depletionMsg + ' Halting construction.'
     });
     recommendations.sort(function(a, b) { return b.priority - a.priority; });
     return recommendations;
+  }
+
+  // === CLOSED-LOOP: Growth stall diagnosis ===
+  // When stall detected, inject specific fix recommendations at HIGH priority
+  if (this._lastStallDiagnosis && this._lastStallDiagnosis.length > 0) {
+    var topCause = this._lastStallDiagnosis[0];
+    recommendations.push({
+      priority: PRIORITIES.EMERGENCY - 10,
+      message: 'GROWTH STALL (' + this._stallCycles + ' cycles): ' + topCause.detail
+    });
+    // Add second cause if exists — often multiple bottlenecks compound
+    if (this._lastStallDiagnosis.length > 1) {
+      var secondCause = this._lastStallDiagnosis[1];
+      recommendations.push({
+        priority: PRIORITIES.EMERGENCY - 15,
+        message: 'ALSO: ' + secondCause.detail
+      });
+    }
+  }
+
+  // === CLOSED-LOOP: Valve trajectory warnings ===
+  var prediction = this._lastValvePrediction;
+  if (prediction) {
+    // Warn if a positive valve is crashing toward zero
+    if (prediction.resToZero !== null && prediction.resToZero < 4 && valves.resValve > 200) {
+      recommendations.push({
+        priority: PRIORITIES.BUDGET_INFO + 15,
+        message: 'Res demand crashing (' + prediction.resDelta + '/cycle). Hits 0 in ~' + prediction.resToZero +
+          ' cycles. Build C/I for employment.'
+      });
+    }
+    if (prediction.comToZero !== null && prediction.comToZero < 4 && valves.comValve > 200) {
+      recommendations.push({
+        priority: PRIORITIES.BUDGET_INFO + 15,
+        message: 'Com demand crashing (' + prediction.comDelta + '/cycle). Build R for workers.'
+      });
+    }
   }
 
   recommendations = recommendations.concat(this._analyzePower(census, budget));
@@ -390,8 +871,11 @@ AIAdvisor.prototype._analyzeBudgetActions = function(budget, census) {
     }
   } else {
     // Metro phase: optimize for score + sustainability
+    // Use valve prediction to decide: if all valves trending positive,
+    // we can afford higher tax for score benefit. If crashing, lower tax.
     var annualRevenue = this._projectRevenue(neutralTax);
     var surplus = annualRevenue - maintenance;
+    var prediction = this._lastValvePrediction;
 
     if (budget.totalFunds < 1000 || surplus < -500) {
       // Need cash, but cap at neutral+2 to limit score damage
@@ -400,7 +884,18 @@ AIAdvisor.prototype._analyzeBudgetActions = function(budget, census) {
       // Rich city — lower tax for score bonus and continued growth
       optimalTax = Math.max(0, neutralTax - 2);
     } else if (budget.totalFunds > 8000) {
-      optimalTax = Math.max(0, neutralTax - 1);
+      // Use valve trajectory: if all deltas are strongly positive,
+      // we can afford slightly higher tax for the score benefit.
+      // If deltas are negative, lower tax to boost growth.
+      if (prediction && prediction.resDelta > 100 && prediction.comDelta > 50) {
+        // Valves growing strong — can sustain neutral tax
+        optimalTax = neutralTax;
+      } else if (prediction && prediction.resDelta < -50) {
+        // Valves crashing — lower tax to boost
+        optimalTax = Math.max(0, neutralTax - 2);
+      } else {
+        optimalTax = Math.max(0, neutralTax - 1);
+      }
     }
     // else stay at neutral
   }
@@ -563,11 +1058,19 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
     return recs;
   }
 
+  // === CLOSED-LOOP: Fund reservation for upcoming special buildings ===
+  // Don't spend on zones when we need to save for stadium/seaport/airport/power
+  var fundReservation = this._shouldReserveFunds();
+
   // Phase-dependent reserve — more aggressive in early/growth phases
   // because growth speed compounds: more zones → more pop → more revenue
   var buildReserve = phase === 'early' ? 1000 :
                      phase === 'growth' ? 1500 :
                      phase === 'metro' ? 5000 : MIN_RESERVE;
+
+  // Add critical fund reservations on top of base reserve
+  buildReserve += fundReservation.totalReserved;
+
   var canAffordZone = budget.totalFunds >= 200 + buildReserve;
 
   if (!canAffordZone) {
@@ -644,16 +1147,27 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   }
 
   // PRIORITY 3: Employment balanced - follow valve demand with ratio awareness
+  // === CLOSED-LOOP: Use valve predictions to build AHEAD of demand ===
+  // If valve is currently low but trending up strongly, start building now
+  // rather than waiting for demand to peak and then scrambling.
+  var prediction = this._lastValvePrediction;
   var buildChoices = [];
 
   if (valves.resValve > 100) {
     buildChoices.push({ tool: 'residential', priority: valves.resValve / 100 });
+  } else if (prediction && prediction.resDelta > 150 && valves.resValve > -200) {
+    // Valve is trending up strongly — pre-build residential
+    buildChoices.push({ tool: 'residential', priority: 1.5 });
   }
   if (valves.comValve > 100) {
     buildChoices.push({ tool: 'commercial', priority: valves.comValve / 75 });
+  } else if (prediction && prediction.comDelta > 100 && valves.comValve > -200) {
+    buildChoices.push({ tool: 'commercial', priority: 1.2 });
   }
   if (valves.indValve > 100) {
     buildChoices.push({ tool: 'industrial', priority: valves.indValve / 75 });
+  } else if (prediction && prediction.indDelta > 100 && valves.indValve > -200) {
+    buildChoices.push({ tool: 'industrial', priority: 1.2 });
   }
 
   buildChoices.sort(function(a, b) { return b.priority - a.priority; });
@@ -1075,7 +1589,53 @@ AIAdvisor.prototype._analyzeScoreOptimization = function(census, budget, valves)
   var eval_ = this.simulation.evaluation;
   if (!eval_ || census.totalPop < 100) return recs;
 
-  // Identify the biggest score drains and recommend specific fixes
+  // === CLOSED-LOOP: Use exact score breakdown for targeted fixes ===
+  var breakdown = this._lastScoreBreakdown || this._calculateScoreBreakdown();
+
+  // Identify the single biggest score drain and recommend the specific fix
+  if (breakdown.biggestProblem && breakdown.biggestProblemCost > 50) {
+    var fix = '';
+    switch (breakdown.biggestProblem) {
+      case 'crime':
+        fix = 'Build police stations in high-crime areas.';
+        break;
+      case 'pollution':
+        fix = 'Move industry away from residential. Parks help marginally.';
+        break;
+      case 'traffic':
+        fix = 'Build parallel roads to reduce congestion.';
+        break;
+      case 'taxes':
+        fix = 'Lower tax rate (each point = ~14 score).';
+        break;
+      case 'unemployment':
+        fix = 'Balance R:(C+I) ratio for employment.';
+        break;
+      case 'fire':
+        fix = 'Build fire stations to prevent fires.';
+        break;
+      case 'housing':
+        // Housing score increases with land value — this is a GOOD problem to have
+        fix = '(High land value = more revenue. Acceptable trade-off.)';
+        break;
+    }
+    recs.push({
+      priority: PRIORITIES.BUDGET_INFO + 8,
+      message: 'Biggest score drain: ' + breakdown.biggestProblem +
+        ' (-' + breakdown.biggestProblemCost + ' pts). ' + fix
+    });
+  }
+
+  // Report multiplicative penalties — each -15% is devastating
+  if (breakdown.penalties.length > 0) {
+    var penaltyStr = breakdown.penalties.join(', ');
+    var totalPenalty = Math.round((1 - breakdown.multiplier) * 100);
+    recs.push({
+      priority: PRIORITIES.BUDGET_INFO + 12,
+      message: 'SCORE MULTIPLIER: -' + totalPenalty + '% from ' + penaltyStr +
+        '. Fix these FIRST — multiplicative penalty on entire score!'
+    });
+  }
 
   // Check for valve collapse penalties (×0.85 each, devastating)
   if (valves.resValve < -1000) {
@@ -1113,6 +1673,16 @@ AIAdvisor.prototype._analyzeScoreOptimization = function(census, budget, valves)
         action: { type: 'wire_connect' }
       });
     }
+  }
+
+  // Fund depletion warning
+  var depletion = this._predictFundDepletion();
+  if (depletion.cyclesUntilBroke < 5 && depletion.cyclesUntilBroke !== Infinity) {
+    recs.push({
+      priority: PRIORITIES.BUDGET_INFO + 20,
+      message: 'BANKRUPT in ~' + depletion.cyclesUntilBroke + ' tax cycles! Net $' +
+        depletion.netFlow + '/yr (rev $' + depletion.revenue + ' - maint $' + depletion.maintenance + ').'
+    });
   }
 
   return recs;
@@ -1384,28 +1954,42 @@ AIAdvisor.prototype.findRoadToConnect = function() {
 
 
 // Find wire path to connect unpowered zones - routes along roads
+// === COMMERCIAL POWER PRIORITY (closed-loop fix) ===
+// From commercial.js line 126: `if (zonePower && zoneScore > -350 ...)`
+// Commercial zones REQUIRE power to grow but can degrade WITHOUT power.
+// This means unpowered commercial zones are actively losing population
+// while gaining nothing. Prioritize wiring commercial zones first.
 AIAdvisor.prototype.findWireToConnect = function() {
   var map = this.map;
   var width = map.width;
   var height = map.height;
 
-  for (var y = 1; y < height - 1; y++) {
-    for (var x = 1; x < width - 1; x++) {
-      var tile = map.getTile(x, y);
-      if (!tile.isZone()) continue;
-      if (tile.isPowered()) continue;
+  // Two passes: first commercial (power-critical), then everything else
+  for (var pass = 0; pass < 2; pass++) {
+    for (var y = 1; y < height - 1; y++) {
+      for (var x = 1; x < width - 1; x++) {
+        var tile = map.getTile(x, y);
+        if (!tile.isZone()) continue;
+        if (tile.isPowered()) continue;
 
-      // Find nearest powered tile (prefer powered roads for wire routing)
-      var powerSource = this._findNearestPowered(x, y);
-      if (!powerSource) continue;
+        // Pass 0: only commercial. Pass 1: everything else.
+        var tv = map.getTileValue(x, y);
+        var isCommercialZone = TileUtils.isCommercial(tv);
+        if (pass === 0 && !isCommercialZone) continue;
+        if (pass === 1 && isCommercialZone) continue;
 
-      // Build wire path, preferring to follow roads
-      var path = this._findWirePath(x, y, powerSource.x, powerSource.y);
-      if (path.length > 0) return path;
+        // Find nearest powered tile (prefer powered roads for wire routing)
+        var powerSource = this._findNearestPowered(x, y);
+        if (!powerSource) continue;
 
-      // Fallback: direct path
-      var directPath = this.findRoadPath(x, y, powerSource.x, powerSource.y);
-      if (directPath.length > 0) return directPath;
+        // Build wire path, preferring to follow roads
+        var path = this._findWirePath(x, y, powerSource.x, powerSource.y);
+        if (path.length > 0) return path;
+
+        // Fallback: direct path
+        var directPath = this.findRoadPath(x, y, powerSource.x, powerSource.y);
+        if (directPath.length > 0) return directPath;
+      }
     }
   }
 

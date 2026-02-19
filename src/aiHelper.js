@@ -200,11 +200,58 @@ AIHelper.prototype._updateStats = function() {
   var projRevenue = this.advisor._projectRevenue(budget.cityTax);
   var projMaint = this.advisor._projectMaintenance();
 
+  // === CLOSED-LOOP: Valve trajectory ===
+  var prediction = this.advisor._lastValvePrediction;
+  var valveTrajectory = '';
+  if (prediction) {
+    var rd = prediction.resDelta > 0 ? '+' + prediction.resDelta : '' + prediction.resDelta;
+    var cd = prediction.comDelta > 0 ? '+' + prediction.comDelta : '' + prediction.comDelta;
+    var id = prediction.indDelta > 0 ? '+' + prediction.indDelta : '' + prediction.indDelta;
+    valveTrajectory = '<div class="ai-stat">Valve Δ/cycle: R' + rd + ' C' + cd + ' I' + id;
+    if (prediction.employment !== undefined) {
+      valveTrajectory += ' | LaggedEmp: ' + Math.round(prediction.employment * 100) + '%';
+    }
+    valveTrajectory += '</div>';
+  }
+
+  // === CLOSED-LOOP: Score breakdown ===
+  var scoreInfo = '';
+  var breakdown = this.advisor._lastScoreBreakdown;
+  if (breakdown && census.totalPop > 50) {
+    var penalties = breakdown.penalties.length > 0 ?
+      ' <span class="ai-demand-neg">×' + breakdown.multiplier.toFixed(2) + '</span>' : '';
+    scoreInfo = '<div class="ai-stat">Score: ' + eval_.cityScore +
+      ' (est ' + breakdown.estimatedScore + ')' + penalties +
+      ' | Top drain: ' + breakdown.biggestProblem + ' (-' + breakdown.biggestProblemCost + ')</div>';
+  } else {
+    scoreInfo = '<div class="ai-stat">Score: ' + eval_.cityScore + '</div>';
+  }
+
+  // === CLOSED-LOOP: Growth stall diagnosis ===
+  var stallInfo = '';
+  var stallDiag = this.advisor._lastStallDiagnosis;
+  if (stallDiag && stallDiag.length > 0) {
+    stallInfo = '<div class="ai-stat ai-demand-neg">STALL[' + this.advisor._stallCycles + ']: ' +
+      stallDiag[0].cause + '</div>';
+  }
+
+  // === CLOSED-LOOP: Fund reservations ===
+  var reserveInfo = '';
+  var fundRes = this.advisor._shouldReserveFunds();
+  if (fundRes.reservations.length > 0) {
+    var resNames = fundRes.reservations.map(function(r) { return r.building + '($' + r.cost + ' ' + r.urgency + ')'; });
+    reserveInfo = '<div class="ai-stat">Reserve: ' + resNames.join(', ') + '</div>';
+  }
+
   $('#aiStatsContent').html(
     '<div class="ai-stat">Phase: ' + phase + ' | Demand: R' + rBar + ' C' + cBar + ' I' + iBar + capStr + '</div>' +
     '<div class="ai-stat">Tax: ' + budget.cityTax + '% (neutral=' + neutralTax + ', valve ' + taxEffectStr + '/cycle)</div>' +
+    valveTrajectory +
     '<div class="ai-stat">Power: ' + powerUtil + '% (' + zonesLeft + ' left) | Emp: ' + employment + '% | Crime: ' + (census.crimeAverage || 0) + '</div>' +
-    '<div class="ai-stat">Score: ' + eval_.cityScore + ' | $' + budget.totalFunds + ' (rev $' + projRevenue + ' - maint $' + projMaint + ')</div>'
+    scoreInfo +
+    '<div class="ai-stat">$' + budget.totalFunds + ' (rev $' + projRevenue + ' - maint $' + projMaint + ')</div>' +
+    reserveInfo +
+    stallInfo
   );
 };
 
@@ -281,6 +328,12 @@ AIHelper.prototype._executeNextAction = function() {
   if (success) {
     this._actionCount++;
     this._lastAction = description;
+    // Track action type for closed-loop mistake detection
+    this.advisor._lastActionType = action.action.type;
+    this.advisor._lastActionTime = Date.now();
+    if (action.action.tool) {
+      this.advisor._lastZoneBuildType = action.action.tool;
+    }
     $('#aiStatus').text('#' + this._actionCount + ': ' + description);
   }
 };
