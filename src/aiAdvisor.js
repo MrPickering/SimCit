@@ -950,7 +950,12 @@ AIAdvisor.prototype._predictLandValueAt = function(x, y) {
 // Returns true if the placement is safe (complement zone reachable).
 AIAdvisor.prototype._hasTrafficRouteTarget = function(x, y, zoneType) {
   var targetCheck;
-  var searchRadius = MAX_TRAFFIC_DISTANCE;
+  // Use a SHORTER radius than the game engine's MAX_TRAFFIC_DISTANCE (30).
+  // The game engine uses RANDOM WALKS along roads, not straight-line distance.
+  // A zone 25 tiles away in straight line might be 40+ road-walk steps away.
+  // Random walks are ~50% efficient, so effective range ≈ MAX_TRAFFIC_DISTANCE / 1.5.
+  // Use 18 tiles to be realistic about what the random walk can actually reach.
+  var searchRadius = 18;
 
   switch (zoneType) {
     case 'residential':
@@ -1246,6 +1251,9 @@ AIAdvisor.prototype.analyze = function() {
   // This BFS identifies which roads are actually connected to the main network
   // so zone scoring rejects locations near disconnected road fragments.
   this._buildRoadNetworkMap();
+
+  // === ZONE COUNTS: Count R/C/I zones for balance enforcement ===
+  this._countZoneTypes();
 
   // === CLOSED-LOOP: Update trends and predictions FIRST ===
   this._updateTrends();
@@ -1695,6 +1703,62 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
     return recs;
   }
 
+  // === ZONE BALANCE ENFORCEMENT ===
+  // In SimCity, residential NEEDS commercial to route traffic to.
+  // Without enough commercial, residential zones fail traffic check → degrade.
+  // Similarly, commercial needs industrial. The game engine checks traffic
+  // routing via random walks, so zones MUST be within road-reach of targets.
+  //
+  // RULE: Enforce minimum zone ratios BEFORE employment check.
+  // The employment ratio can be misleading (high employment = few residents),
+  // which causes the AI to keep building residential while ignoring commercial.
+  var zc = this._zoneCounts || { res: 0, com: 0, ind: 0, total: 0 };
+  if (zc.total > 6) {
+    // Need at least 1 commercial per 3 residential for traffic routing
+    var minCom = Math.max(1, Math.floor(zc.res / 3));
+    if (zc.com < minCom) {
+      var loc = this.findBestZoneLocation('commercial');
+      if (loc && loc.score > -100) {
+        recs.push({
+          priority: PRIORITIES.ZONE_DEMAND + 20, // HIGHEST zone priority
+          message: 'Commercial deficit (' + zc.com + 'C for ' + zc.res + 'R). ' +
+            'Residential needs commercial for traffic routing.',
+          action: { type: 'build', tool: 'commercial' }
+        });
+        return recs;
+      }
+    }
+    // Need at least 1 industrial per 3 residential for jobs
+    var minInd = Math.max(1, Math.floor(zc.res / 3));
+    if (zc.ind < minInd) {
+      var loc = this.findBestZoneLocation('industrial');
+      if (loc && loc.score > -100) {
+        recs.push({
+          priority: PRIORITIES.ZONE_DEMAND + 18,
+          message: 'Industrial deficit (' + zc.ind + 'I for ' + zc.res + 'R). ' +
+            'Building industrial for employment balance.',
+          action: { type: 'build', tool: 'industrial' }
+        });
+        return recs;
+      }
+    }
+    // Don't let residential grow beyond 2x commercial+industrial
+    if (zc.res > (zc.com + zc.ind) * 2 && (zc.com + zc.ind) > 0) {
+      // Residential is oversupplied — build C or I based on valve
+      var tool = valves.comValve >= valves.indValve ? 'commercial' : 'industrial';
+      var loc = this.findBestZoneLocation(tool);
+      if (loc && loc.score > -100) {
+        recs.push({
+          priority: PRIORITIES.ZONE_DEMAND + 16,
+          message: 'Residential oversaturated (' + zc.res + 'R vs ' + zc.com +
+            'C+' + zc.ind + 'I). Building ' + tool + '.',
+          action: { type: 'build', tool: tool }
+        });
+        return recs;
+      }
+    }
+  }
+
   // Calculate employment balance (same formula as valve engine)
   var normalizedResPop = census.resPop / 8;
   var employment = 1;
@@ -1725,6 +1789,7 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   }
 
   // PRIORITY 2: Excess jobs - need more residents
+  // But ONLY if zone balance is OK (checked above).
   if (employment > EMPLOYMENT_HIGH || (normalizedResPop < 2 && valves.resValve > 0)) {
     var loc = this.findBestZoneLocation('residential');
     if (loc && loc.score > -100) {
@@ -2934,6 +2999,34 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   else if (this._hasNearbyConnectedRoad(x, y, 8)) score += 10;
   else return -9999;
 
+  // === COMPACTNESS BONUS (DOMINANT FACTOR) ===
+  // A compact city EXPONENTIALLY outperforms a sprawling one:
+  // - Traffic routes complete in fewer steps → zones don't degrade
+  // - Power plants cover more zones → fewer plants needed
+  // - Police/fire stations cover more zones → less maintenance
+  // - Land value rises faster with nearby development
+  // - Roads serve more zones → less road maintenance per zone
+  // Count existing zone centers within 6 tiles. Each nearby zone = +40 score.
+  // In a compact city (4-tile spacing), a location has ~4-6 neighbors → +160-240.
+  // An isolated location has 0 neighbors → +0. Difference: +160-240.
+  // This MUST dominate other factors to prevent sprawl.
+  var nearbyZones = this._countNearbyZones(x, y, 6);
+  score += nearbyZones * 40;
+
+  // === SPRAWL PENALTY (HARD DISTANCE LIMIT) ===
+  // Penalize locations far from the grid origin (starter city center).
+  // This prevents the AI from building at the edge of long road extensions.
+  if (this._plan.initialized) {
+    var gx = this._plan.gridOriginX;
+    var gy = this._plan.gridOriginY;
+    var distFromCore = Math.abs(x - gx) + Math.abs(y - gy);
+    score -= distFromCore * 3;
+    // Accelerating penalty past 20 tiles — sprawl becomes exponentially worse
+    if (distFromCore > 20) score -= (distFromCore - 20) * 6;
+    // Hard reject past 35 tiles — no zone should be this far from core
+    if (distFromCore > 35) return -9999;
+  }
+
   // Power connectivity — unpowered zones get -500 to zoneScore
   // which drops growth probability significantly
   if (this._hasNearbyPower(x, y, 4)) score += 50;
@@ -3088,10 +3181,10 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
 
   // Prefer closer to city center — from blockMapUtils.js:
   // landValue = (34 - cityCentreDistance/2) * 4 + terrain - pollution
-  // So center proximity is already baked into land value, but add small bonus
+  // Center proximity matters for commercial especially.
   var dx = x - this.map.cityCentreX;
   var dy = y - this.map.cityCentreY;
-  score -= Math.sqrt(dx * dx + dy * dy) * 0.3;
+  score -= Math.sqrt(dx * dx + dy * dy) * 0.5;
 
   return score;
 };
@@ -3099,6 +3192,15 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
 
 AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
   var score = 0;
+
+  // SPRAWL PENALTY for large buildings too — keep them near the core
+  if (this._plan.initialized) {
+    var gx = this._plan.gridOriginX;
+    var gy = this._plan.gridOriginY;
+    var distFromCore = Math.abs(x - gx) + Math.abs(y - gy);
+    score -= distFromCore * 2;
+    if (distFromCore > 30) score -= (distFromCore - 30) * 4;
+  }
   var blockMaps = this.blockMaps;
 
   // Must be near CONNECTED road network — disconnected fragments don't count
@@ -3233,6 +3335,43 @@ AIAdvisor.prototype._countDisconnectedZones = function() {
     }
   }
   return count;
+};
+
+
+// Count existing zone centers within radius of a location.
+// Used for COMPACTNESS scoring — a location surrounded by existing zones
+// is FAR better than an isolated location in the middle of nowhere.
+// In SimCity, compact cities outperform sprawling ones in every metric:
+// traffic routing, power coverage, police/fire coverage, land value.
+AIAdvisor.prototype._countNearbyZones = function(x, y, radius) {
+  var map = this.map;
+  var count = 0;
+  for (var dy = -radius; dy <= radius; dy++) {
+    for (var dx = -radius; dx <= radius; dx++) {
+      var nx = x + dx;
+      var ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
+      if (map.getTile(nx, ny).isZone()) count++;
+    }
+  }
+  return count;
+};
+
+
+// Count zone types on the map. Called once per analyze() cycle.
+// Results cached in this._zoneCounts for zone balance enforcement.
+AIAdvisor.prototype._countZoneTypes = function() {
+  var map = this.map;
+  var res = 0, com = 0, ind = 0;
+  for (var y = 1; y < map.height - 1; y++) {
+    for (var x = 1; x < map.width - 1; x++) {
+      var tv = map.getTileValue(x, y);
+      if (TileUtils.isResidential(tv)) res++;
+      else if (TileUtils.isCommercial(tv)) com++;
+      else if (TileUtils.isIndustrial(tv)) ind++;
+    }
+  }
+  this._zoneCounts = { res: res, com: com, ind: ind, total: res + com + ind };
 };
 
 
