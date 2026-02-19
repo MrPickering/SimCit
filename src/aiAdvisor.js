@@ -1608,15 +1608,12 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
   var phase = this._getPhase();
 
-  // Self-correction: cautious mode suppresses zone building when failing too much.
-  // Infrastructure and budget actions still run — only new zone placement pauses.
-  if (this._strategyOverride === 'cautious' && totalZones > 0) {
-    recs.push({
-      priority: PRIORITIES.ZONE_DEMAND,
-      message: 'CAUTIOUS: Pausing zone building until performance improves.'
-    });
-    return recs;
-  }
+  // NOTE: "cautious mode" self-correction was removed. It suppressed ALL zone
+  // building when >40% of recent actions failed, creating a deadlock:
+  // bad scoring → failures → cautious → no building → no successes → stays cautious.
+  // The proper fix is better scoring (pollution/sprawl/power constraints),
+  // not suppressing all building. The score threshold (> -100) in findBestZoneLocation
+  // is sufficient quality control.
 
   // Bootstrap: build starter city
   if (totalZones === 0 && census.totalPop === 0 && budget.totalFunds >= 4500) {
@@ -3581,18 +3578,9 @@ AIAdvisor.prototype._recordOutcome = function(result) {
   this._recentOutcomes.push({ result: result, time: Date.now() });
   if (this._recentOutcomes.length > 20) this._recentOutcomes.shift();
 
-  // Self-correction: if >40% of recent outcomes are failures, go cautious
-  if (this._recentOutcomes.length >= 5) {
-    var fails = 0;
-    for (var i = 0; i < this._recentOutcomes.length; i++) {
-      if (this._recentOutcomes[i].result === 'fail') fails++;
-    }
-    if (fails / this._recentOutcomes.length > 0.4) {
-      this._strategyOverride = 'cautious';
-    } else {
-      this._strategyOverride = null;
-    }
-  }
+  // Track failure rate for diagnostics (shown in AI panel) but do NOT
+  // suppress zone building. Cautious mode created deadlocks — see _analyzeZoneDemand.
+  this._strategyOverride = null; // Always null — cautious mode removed
 };
 
 
