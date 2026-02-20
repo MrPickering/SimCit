@@ -353,13 +353,13 @@ AIAdvisor.prototype.findAbandonedZone = function() {
       }
 
       // Both broken — definitely dead
-      if (!hasRoad && !hasPower) {
+      if (!hasConnectedRoad && !hasPower) {
         score += 100;
       }
 
       if (score > worstScore) {
         worstScore = score;
-        worst = { x: x, y: y, score: score, hasRoad: hasRoad, hasPower: hasPower };
+        worst = { x: x, y: y, score: score, hasRoad: hasConnectedRoad, hasPower: hasPower };
       }
     }
   }
@@ -3159,8 +3159,22 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
       var cdy = y - this.map.cityCentreY;
       var dist = Math.sqrt(cdx * cdx + cdy * cdy);
       score += Math.max(0, 64 - Math.floor(dist));
+      // === DISTRICT RULE: Commercial belongs NORTH (residential side) ===
+      // Commercial customers are residential. Place near them for land value,
+      // traffic routing success, and logical district separation.
+      // Without this, commercial freely scores well in the industrial zone
+      // south of the main road due to +60 center bonus dwarfing the old -3/tile.
       if (this._plan.initialized) {
-        score -= Math.abs(y - this._plan.gridOriginY) * 3;
+        var gridY = this._plan.gridOriginY;
+        if (y > gridY) {
+          // South of main road — strong penalty, hard reject past 6 tiles
+          var southDist = y - gridY;
+          score -= southDist * 30;
+          if (southDist > 6) return -9999;
+        } else {
+          // North of main road — bonus for being near residential
+          score += 30;
+        }
       }
       break;
 

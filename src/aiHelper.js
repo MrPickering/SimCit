@@ -899,25 +899,24 @@ AIHelper.prototype._buildZone = function(toolName) {
     tool.modifyIfEnoughFunding(budget);
     if (tool.result !== tool.TOOLRESULT_NO_MONEY) {
       // Ensure road access — builds toward CONNECTED network
-      var roadOk = this._ensureRoadAccess(loc.x, loc.y, size);
+      this._ensureRoadAccess(loc.x, loc.y, size);
       // Wire the MINIMUM path to connect this zone to the power grid
       this._ensurePowerAccess(loc.x, loc.y, size);
 
-      if (!roadOk) {
-        // Road connection failed — zone will be stranded.
-        // Rebuild network map to check if road building connected us anyway
-        this.advisor._buildRoadNetworkMap();
-        if (!this.advisor._hasAdjacentConnectedRoad(loc.x, loc.y)) {
-          // Truly failed — bulldoze the zombie zone to free the land
-          var bulldozerTool = this.tools.bulldozer;
-          bulldozerTool.doTool(loc.x, loc.y, this.blockMaps);
-          if (bulldozerTool.result === bulldozerTool.TOOLRESULT_OK) {
-            bulldozerTool.modifyIfEnoughFunding(budget);
-          } else {
-            bulldozerTool.clear();
-          }
-          return false;
+      // MANDATORY post-placement verification.
+      // _ensureRoadAccess() may return true based on stale road network data
+      // from the analyze() cycle start. ALWAYS rebuild and verify.
+      this.advisor._buildRoadNetworkMap();
+      if (!this.advisor._hasAdjacentConnectedRoad(loc.x, loc.y)) {
+        // Zone is stranded — bulldoze the zombie to free the land
+        var bulldozerTool = this.tools.bulldozer;
+        bulldozerTool.doTool(loc.x, loc.y, this.blockMaps);
+        if (bulldozerTool.result === bulldozerTool.TOOLRESULT_OK) {
+          bulldozerTool.modifyIfEnoughFunding(budget);
+        } else {
+          bulldozerTool.clear();
         }
+        return false;
       }
       return true;
     }
