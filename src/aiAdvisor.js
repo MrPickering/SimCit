@@ -175,6 +175,14 @@ function AIAdvisor(simulation, gameMap, blockMaps) {
   this._previousValvePrediction = null; // For prediction accuracy tracking
   this._predictionHits = 0;
   this._predictionTotal = 0;
+
+  // === ZONE HEALTH AUDIT ===
+  // The AI equivalent of "looking at the screenshot" — periodically scans
+  // every zone on the map, diagnoses ALL health conditions, and queues fixes.
+  // This is what makes the AI as smart as a human who can see the game state.
+  this._zoneHealthIssues = [];    // Current list of sick zones + diagnoses
+  this._blacklistedLocations = {}; // {x,y} → expiry tick. Locations where zones failed.
+  this._auditTick = 0;            // Increments each action cycle
 }
 
 
@@ -3010,6 +3018,10 @@ AIAdvisor.prototype.findTrafficBottleneck = function() {
 // So distance from center and pollution are the dominant land value factors.
 
 AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
+  // === BLACKLIST CHECK ===
+  // If the AI previously placed a zone here and it failed, avoid repeating the mistake.
+  if (this.isLocationBlacklisted(x, y)) return -9999;
+
   var score = 0;
   var blockMaps = this.blockMaps;
 
@@ -3819,6 +3831,218 @@ AIAdvisor.prototype.getPerformanceMetrics = function(successCount, failCount, ne
     phase: this._getPhase(),
     strategyOverride: this._strategyOverride
   };
+};
+
+
+// === ZONE HEALTH AUDIT ===
+//
+// The AI equivalent of a human looking at the game and saying:
+// "That zone has a red X — it has no road. That commercial zone is in the
+// wrong place. That residential zone is choking on pollution."
+//
+// Scans EVERY zone on the map and checks ALL conditions the game engine
+// requires for growth (from residential.js, commercial.js, industrial.js):
+//   1. Road connectivity to the main network
+//   2. Power access (critical for commercial)
+//   3. Traffic routing to complementary zone type
+//   4. Pollution level (lethal for residential > 128)
+//   5. Land value (commercial growth capped by landValue >> 5)
+//
+// Returns a prioritized list of sick zones with specific diagnoses and fixes.
+
+AIAdvisor.prototype.auditAllZones = function() {
+  var map = this.map;
+  var blockMaps = this.blockMaps;
+  var issues = [];
+
+  // Rebuild road network for fresh connectivity data
+  this._buildRoadNetworkMap();
+
+  for (var y = 1; y < map.height - 1; y++) {
+    for (var x = 1; x < map.width - 1; x++) {
+      var tile = map.getTile(x, y);
+      if (!tile.isZone()) continue;
+
+      var tv = map.getTileValue(x, y);
+      var isRes = TileUtils.isResidential(tv);
+      var isCom = TileUtils.isCommercial(tv);
+      var isInd = TileUtils.isIndustrial(tv);
+      if (!isRes && !isCom && !isInd) continue; // Skip non-RCI zones (power plants, etc.)
+
+      var zoneType = isRes ? 'residential' : (isCom ? 'commercial' : 'industrial');
+      var pollution = this._safeBlockGet(blockMaps.pollutionDensityMap, x, y);
+      var hasRoad = this._hasAdjacentConnectedRoad(x, y);
+      var hasPower = tile.isPowered();
+      var problems = [];
+
+      // 1. ROAD CONNECTIVITY — zone degrades immediately without connected road
+      if (!hasRoad) {
+        var nearNetwork = this._hasNearbyConnectedRoad(x, y, 8);
+        problems.push({
+          type: 'no_road',
+          severity: nearNetwork ? 3 : 5,
+          fix: nearNetwork ? 'build_road' : 'bulldoze'
+        });
+      }
+
+      // 2. POWER — commercial REQUIRES power (commercial.js:126), others degrade
+      if (!hasPower) {
+        problems.push({
+          type: 'no_power',
+          severity: isCom ? 4 : 2,
+          fix: 'wire_power'
+        });
+      }
+
+      // 3. TRAFFIC ROUTING — zone MUST route to complementary type within 30 tiles
+      // Only meaningful if zone has road (needs road to route traffic)
+      if (hasRoad && !this._hasTrafficRouteTarget(x, y, zoneType)) {
+        var target = isRes ? 'commercial' : (isCom ? 'industrial' : 'residential');
+        problems.push({
+          type: 'no_traffic_route',
+          severity: 4,
+          fix: 'build_complementary',
+          targetType: target
+        });
+      }
+
+      // 4. POLLUTION — residential hard-blocked at 128 (residential.js:121)
+      if (isRes && pollution > 128) {
+        problems.push({
+          type: 'lethal_pollution',
+          severity: 5,
+          fix: 'bulldoze'
+        });
+      } else if (isRes && pollution > SAFE_RESIDENTIAL_POLLUTION) {
+        // Not lethal yet but growth severely impaired
+        problems.push({
+          type: 'high_pollution',
+          severity: 2,
+          fix: 'build_park'
+        });
+      }
+
+      // 5. LAND VALUE — commercial growth cap = landValue >> 5 (commercial.js:48)
+      if (isCom) {
+        var maxPop = this._maxCommercialPopAt(x, y);
+        if (maxPop < 1) {
+          problems.push({
+            type: 'low_land_value',
+            severity: 3,
+            fix: 'build_park'
+          });
+        }
+      }
+
+      // 6. BOTH BROKEN — no road AND no power = definitely dead
+      if (!hasRoad && !hasPower) {
+        // Compound severity — this zone is hopeless unless very close to network
+        var anyNearby = this._hasNearbyConnectedRoad(x, y, 5);
+        if (!anyNearby) {
+          problems.push({
+            type: 'completely_stranded',
+            severity: 5,
+            fix: 'bulldoze'
+          });
+        }
+      }
+
+      if (problems.length > 0) {
+        problems.sort(function(a, b) { return b.severity - a.severity; });
+        issues.push({
+          x: x, y: y,
+          zoneType: zoneType,
+          problems: problems,
+          worstSeverity: problems[0].severity,
+          topFix: problems[0].fix,
+          targetType: problems[0].targetType || null
+        });
+      }
+    }
+  }
+
+  // Sort by worst severity descending — fix the most critical zones first
+  issues.sort(function(a, b) { return b.worstSeverity - a.worstSeverity; });
+  this._zoneHealthIssues = issues;
+  return issues;
+};
+
+
+// Convert the top zone health issue into an actionable recommendation.
+// This is what gets injected into decideBestAction() at high priority.
+AIAdvisor.prototype.getTopHealthAction = function() {
+  var issues = this._zoneHealthIssues;
+  if (!issues || issues.length === 0) return null;
+
+  var top = issues[0];
+  if (top.worstSeverity < 2) return null; // Minor issues don't warrant immediate action
+
+  switch (top.topFix) {
+    case 'bulldoze':
+      return {
+        priority: PRIORITIES.ROAD_CONNECT + 5, // Higher than normal infrastructure
+        message: 'HEALTH AUDIT: ' + top.zoneType + ' at (' + top.x + ',' + top.y +
+          ') is dead (' + top.problems[0].type + '). Bulldozing.',
+        action: { type: 'cleanup_abandoned' }
+      };
+
+    case 'build_road':
+      return {
+        priority: PRIORITIES.ROAD_CONNECT,
+        message: 'HEALTH AUDIT: ' + top.zoneType + ' at (' + top.x + ',' + top.y +
+          ') has no connected road. Building road to network.',
+        action: { type: 'build_roads' }
+      };
+
+    case 'wire_power':
+      return {
+        priority: PRIORITIES.WIRE_CONNECT,
+        message: 'HEALTH AUDIT: ' + top.zoneType + ' at (' + top.x + ',' + top.y +
+          ') is unpowered' + (top.zoneType === 'commercial' ? ' (CANNOT grow)' : '') + '.',
+        action: { type: 'wire_connect' }
+      };
+
+    case 'build_complementary':
+      // Zone exists but has no traffic route target — need to build the missing type
+      var tool = top.targetType;
+      return {
+        priority: PRIORITIES.ZONE_DEMAND + 10, // Slightly above normal demand
+        message: 'HEALTH AUDIT: ' + top.zoneType + ' at (' + top.x + ',' + top.y +
+          ') cannot route traffic. Need ' + tool + ' within 18 tiles.',
+        action: { type: 'build', tool: tool }
+      };
+
+    case 'build_park':
+      return {
+        priority: PRIORITIES.PARKS + 10,
+        message: 'HEALTH AUDIT: ' + top.zoneType + ' at (' + top.x + ',' + top.y +
+          ') needs land value boost. Building park.',
+        action: { type: 'build_park', x: top.x, y: top.y - 2 } // Park near zone
+      };
+
+    default:
+      return null;
+  }
+};
+
+
+// Blacklist a location where a zone failed. Prevents the AI from
+// repeating the same mistake at the same spot.
+AIAdvisor.prototype.blacklistLocation = function(x, y) {
+  // Blacklist expires after 50 audit ticks (~150 action cycles)
+  // so locations become available again as city infrastructure grows.
+  this._blacklistedLocations[x + ',' + y] = this._auditTick + 50;
+};
+
+AIAdvisor.prototype.isLocationBlacklisted = function(x, y) {
+  var key = x + ',' + y;
+  var expiry = this._blacklistedLocations[key];
+  if (!expiry) return false;
+  if (this._auditTick > expiry) {
+    delete this._blacklistedLocations[key];
+    return false;
+  }
+  return true;
 };
 
 

@@ -277,6 +277,27 @@ AIHelper.prototype._updateStats = function() {
     reserveInfo = '<div class="ai-stat">Reserve: ' + resNames.join(', ') + '</div>';
   }
 
+  // === Zone Health Audit summary ===
+  var healthInfo = '';
+  var healthIssues = this.advisor._zoneHealthIssues;
+  if (healthIssues && healthIssues.length > 0) {
+    var critical = 0, warning = 0;
+    for (var h = 0; h < healthIssues.length; h++) {
+      if (healthIssues[h].worstSeverity >= 4) critical++;
+      else warning++;
+    }
+    healthInfo = '<div class="ai-stat' + (critical > 0 ? ' ai-demand-neg' : '') + '">Health: ';
+    if (critical > 0) healthInfo += critical + ' sick zones';
+    if (critical > 0 && warning > 0) healthInfo += ', ';
+    if (warning > 0) healthInfo += warning + ' warnings';
+    if (healthIssues[0]) healthInfo += ' | Top: ' + healthIssues[0].problems[0].type;
+    healthInfo += '</div>';
+  }
+
+  var blacklistCount = Object.keys(this.advisor._blacklistedLocations).length;
+  var blacklistInfo = blacklistCount > 0 ?
+    '<div class="ai-stat">Blacklisted: ' + blacklistCount + ' locations</div>' : '';
+
   $('#aiStatsContent').html(
     '<div class="ai-stat">Phase: ' + phase + ' | Demand: R' + rBar + ' C' + cBar + ' I' + iBar + capStr + '</div>' +
     '<div class="ai-stat">Tax: ' + budget.cityTax + '% (neutral=' + neutralTax + ', valve ' + taxEffectStr + '/cycle)</div>' +
@@ -285,6 +306,8 @@ AIHelper.prototype._updateStats = function() {
     scoreInfo +
     '<div class="ai-stat">$' + budget.totalFunds + ' (rev $' + projRevenue + ' - maint $' + projMaint + ')</div>' +
     reserveInfo +
+    healthInfo +
+    blacklistInfo +
     stallInfo
   );
 
@@ -304,18 +327,23 @@ AIHelper.prototype._makeBar = function(value) {
 
 
 AIHelper.prototype._executeNextAction = function() {
-  // === INFRASTRUCTURE AUDIT: Run BEFORE action dispatch ===
-  // Every 3rd cycle, scan for broken infrastructure and fix it immediately.
-  // This catches zones that were placed with failed road/power connections,
-  // or connections that were destroyed by disasters.
-  this._infraCheckCounter = (this._infraCheckCounter || 0) + 1;
-  if (this._infraCheckCounter % 3 === 0) {
-    var fixed = this._fixBrokenInfrastructure();
-    if (fixed) {
-      this._actionCount++;
-      this._lastAction = 'Fixed broken infrastructure';
-      $('#aiStatus').text('#' + this._actionCount + ': Fixed broken infrastructure');
-      return; // Spend this cycle on infrastructure, not new building
+  // === ZONE HEALTH AUDIT: The AI "looks at the screenshot" ===
+  // Every 3rd cycle, scan EVERY zone on the map and check ALL health conditions.
+  // This replaces the old _fixBrokenInfrastructure which only checked road/power.
+  // Now checks: road, power, traffic routing, pollution, land value.
+  this.advisor._auditTick++;
+  if (this.advisor._auditTick % 3 === 0) {
+    this.advisor.auditAllZones();
+    var healthAction = this.advisor.getTopHealthAction();
+    if (healthAction) {
+      // Execute the health fix using the normal action dispatch
+      var healthSuccess = this._executeAction(healthAction);
+      if (healthSuccess) {
+        this._actionCount++;
+        this._lastAction = healthAction.message;
+        $('#aiStatus').text('#' + this._actionCount + ': ' + healthAction.message);
+        return; // Spend this cycle on health fix, not new building
+      }
     }
   }
 
@@ -916,6 +944,8 @@ AIHelper.prototype._buildZone = function(toolName) {
         } else {
           bulldozerTool.clear();
         }
+        // BLACKLIST this location so AI doesn't repeat the mistake
+        this.advisor.blacklistLocation(loc.x, loc.y);
         return false;
       }
       return true;
@@ -1310,7 +1340,29 @@ AIHelper.prototype._getToolSize = function(toolName) {
 };
 
 
-// === INFRASTRUCTURE AUDIT LOOP ===
+// Execute a single action from its recommendation object.
+// Used by both the normal action flow and the zone health audit.
+AIHelper.prototype._executeAction = function(rec) {
+  if (!rec || !rec.action) return false;
+  var a = rec.action;
+  switch (a.type) {
+    case 'build_starter': return this._buildStarterCity();
+    case 'build': return this._buildZone(a.tool);
+    case 'build_roads': return this._buildRoadConnection();
+    case 'wire_connect': return this._buildWireConnection();
+    case 'set_tax': return this._setTaxRate(a.value);
+    case 'set_funding': return this._setFunding(a.road, a.fire, a.police);
+    case 'bulldoze_rubble': return this._bulldozeRubble();
+    case 'expand_grid': return this._expandGrid(a.zoneType);
+    case 'build_park': return this._buildParkAt(a.x, a.y);
+    case 'reduce_pollution': return this._reducePollution();
+    case 'cleanup_abandoned': return this._cleanupAbandonedZone();
+    default: return false;
+  }
+};
+
+
+// === INFRASTRUCTURE AUDIT LOOP (LEGACY — kept as fallback) ===
 // Scans the entire map for broken infrastructure and fixes it.
 // This is the AI's "look at what I built and fix what's wrong" loop.
 //
