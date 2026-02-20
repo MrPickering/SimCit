@@ -1597,12 +1597,27 @@ AIAdvisor.prototype._analyzePower = function(census, budget) {
       });
     }
   } else if (census.unpoweredZoneCount > 0) {
-    // Have capacity but zones aren't connected - wiring issue, not capacity
+    // Have capacity but zones aren't connected.
+    // If MANY zones are unpowered (>30%), this is a major infrastructure crisis —
+    // the AI built zones it can't reach. Prioritize cleanup over more building.
+    var unpoweredRatio = census.unpoweredZoneCount / Math.max(1, totalZones);
+    var wirePriority = unpoweredRatio > 0.3 ? PRIORITIES.POWER : PRIORITIES.WIRE_CONNECT;
     recs.push({
-      priority: PRIORITIES.WIRE_CONNECT,
-      message: census.unpoweredZoneCount + ' zones need power lines (have capacity).',
+      priority: wirePriority,
+      message: census.unpoweredZoneCount + '/' + totalZones + ' zones unpowered (' +
+        Math.round(unpoweredRatio * 100) + '%). ' +
+        (unpoweredRatio > 0.3 ? 'CRISIS: Halt building, fix infrastructure.' : 'Wiring issue.'),
       action: { type: 'wire_connect' }
     });
+
+    // If more than 30% unpowered, also suppress zone building by not emitting demand actions
+    if (unpoweredRatio > 0.3) {
+      this._powerCrisis = true;
+    } else {
+      this._powerCrisis = false;
+    }
+  } else {
+    this._powerCrisis = false;
   }
 
   return recs;
@@ -1623,12 +1638,16 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
   var phase = this._getPhase();
 
-  // NOTE: "cautious mode" self-correction was removed. It suppressed ALL zone
-  // building when >40% of recent actions failed, creating a deadlock:
-  // bad scoring → failures → cautious → no building → no successes → stays cautious.
-  // The proper fix is better scoring (pollution/sprawl/power constraints),
-  // not suppressing all building. The score threshold (> -100) in findBestZoneLocation
-  // is sufficient quality control.
+  // POWER CRISIS GATE: If >30% of zones are unpowered, STOP building new zones.
+  // The AI must fix its existing infrastructure before adding more broken zones.
+  // This prevents the death spiral: build zone → can't power → build more → can't power.
+  if (this._powerCrisis && phase !== 'bootstrap') {
+    recs.push({
+      priority: PRIORITIES.ZONE_DEMAND,
+      message: 'POWER CRISIS: Too many unpowered zones. Fix infrastructure before building.'
+    });
+    return recs;
+  }
 
   // Bootstrap: build starter city
   if (totalZones === 0 && census.totalPop === 0 && budget.totalFunds >= 4500) {
@@ -3022,7 +3041,19 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   // If the AI previously placed a zone here and it failed, avoid repeating the mistake.
   if (this.isLocationBlacklisted(x, y)) return -9999;
 
-  var score = 0;
+  // === BUILDABLE LAND DENSITY CHECK ===
+  // The AI must understand TERRAIN. A 3x3 clear patch on a tiny peninsula surrounded
+  // by water is a terrible location — roads/wires can't reach it economically.
+  // Count buildable tiles in a 9x9 area (4-tile radius). If less than 50% is land,
+  // the location is on a water-edge sliver and should be rejected.
+  var landCount = this._countBuildableTiles(x, y, 4);
+  var totalChecked = (4 * 2 + 1) * (4 * 2 + 1); // 81 tiles in 9x9
+  if (landCount < totalChecked * 0.45) return -9999; // Less than 45% buildable = reject
+  // Soft penalty for partially water-surrounded locations
+  var landRatio = landCount / totalChecked;
+  var waterPenalty = landRatio < 0.7 ? Math.round((0.7 - landRatio) * 300) : 0;
+
+  var score = 0 - waterPenalty;
   var blockMaps = this.blockMaps;
 
   // Road adjacency is critical — from simulation source:
@@ -3046,6 +3077,16 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   // This MUST dominate other factors to prevent sprawl.
   var nearbyZones = this._countNearbyZones(x, y, 6);
   score += nearbyZones * 40;
+
+  // === WATER CROSSING PENALTY ===
+  // If the straight-line path from this location to the city center crosses water,
+  // the zone will need expensive bridge roads/wires that are fragile and hard to power.
+  // Check a sampled path for water tiles — if ANY water is in the way, heavy penalty.
+  if (this._plan.initialized) {
+    var waterCrossings = this._countWaterCrossings(x, y, this._plan.gridOriginX, this._plan.gridOriginY);
+    if (waterCrossings > 3) return -9999;  // More than 3 water tiles = too many channels
+    if (waterCrossings > 0) score -= waterCrossings * 80;  // Each water tile = -80
+  }
 
   // === SPRAWL PENALTY (ZONE-TYPE AWARE) ===
   // Penalize locations far from the grid origin (starter city center).
@@ -3256,6 +3297,24 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
 
 
 AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
+  // === BLACKLIST CHECK ===
+  if (this.isLocationBlacklisted(x, y)) return -9999;
+
+  // === BUILDABLE LAND DENSITY CHECK ===
+  // Large buildings (4x4+) need even more buildable land around them.
+  // Reject locations on water-edge slivers. Port is exempt (needs water).
+  if (toolName !== 'port') {
+    var landCount = this._countBuildableTiles(x, y, 5);
+    var totalChecked = (5 * 2 + 1) * (5 * 2 + 1); // 121 tiles in 11x11
+    if (landCount < totalChecked * 0.45) return -9999;
+  }
+
+  // === WATER CROSSING CHECK ===
+  if (this._plan.initialized) {
+    var wc = this._countWaterCrossings(x, y, this._plan.gridOriginX, this._plan.gridOriginY);
+    if (wc > 3) return -9999;
+  }
+
   var score = 0;
 
   // SPRAWL PENALTY for large buildings — but NOT for coal/nuclear power plants.
@@ -3550,6 +3609,56 @@ AIAdvisor.prototype._checkNearbyResidentialPollution = function(x, y, radius) {
     }
   }
   return maxPollution;
+};
+
+
+// Count water tiles along the straight-line path between two points.
+// Uses Bresenham-style stepping to sample tiles along the path.
+// Returns the number of water tiles encountered.
+AIAdvisor.prototype._countWaterCrossings = function(x1, y1, x2, y2) {
+  var map = this.map;
+  var dx = x2 - x1;
+  var dy = y2 - y1;
+  var steps = Math.max(Math.abs(dx), Math.abs(dy));
+  if (steps === 0) return 0;
+
+  var waterCount = 0;
+  var sx = dx / steps;
+  var sy = dy / steps;
+
+  for (var i = 0; i <= steps; i++) {
+    var cx = Math.round(x1 + sx * i);
+    var cy = Math.round(y1 + sy * i);
+    if (cx < 0 || cy < 0 || cx >= map.width || cy >= map.height) continue;
+    var tv = map.getTileValue(cx, cy);
+    if (tv >= TileValues.WATER_LOW && tv <= TileValues.WATER_HIGH) {
+      waterCount++;
+    }
+  }
+  return waterCount;
+};
+
+
+// Count buildable (non-water) tiles in a square radius around a point.
+// Used to detect tiny peninsulas and water-edge slivers where zones would be stranded.
+// Water tiles: values 2-20 (RIVER through LASTRIVEDGE).
+// Returns the count of tiles that are land (buildable or already built on).
+AIAdvisor.prototype._countBuildableTiles = function(x, y, radius) {
+  var map = this.map;
+  var count = 0;
+  for (var dy = -radius; dy <= radius; dy++) {
+    for (var dx = -radius; dx <= radius; dx++) {
+      var nx = x + dx;
+      var ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
+      var tv = map.getTileValue(nx, ny);
+      // Water tiles are 2-20. Everything else is land (dirt, roads, zones, etc.)
+      if (tv < TileValues.WATER_LOW || tv > TileValues.WATER_HIGH) {
+        count++;
+      }
+    }
+  }
+  return count;
 };
 
 
