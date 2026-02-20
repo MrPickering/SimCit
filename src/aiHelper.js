@@ -200,10 +200,12 @@ AIHelper.prototype._updateStats = function() {
   var cBar = this._makeBar(valves.comValve);
   var iBar = this._makeBar(valves.indValve);
 
-  // Power utilization (math-based)
+  // Power utilization — use MAP-BASED counts (not census) for consistency
+  // with advisor decisions. Census lags 1 cycle, causing stale display.
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
-  var coalPlants = census.coalPowerPop;
-  var nuclearPlants = census.nuclearPowerPop;
+  var zc = this.advisor._zoneCounts || {};
+  var coalPlants = zc.coalPlants || 0;
+  var nuclearPlants = zc.nuclearPlants || 0;
   var maxPower = coalPlants * 700 + nuclearPlants * 2000;
   var estConsumption = totalZones * 12 + (coalPlants + nuclearPlants) * 16;
   var powerUtil = maxPower > 0 ? Math.round(estConsumption / maxPower * 100) : 0;

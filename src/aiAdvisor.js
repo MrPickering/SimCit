@@ -802,10 +802,13 @@ AIAdvisor.prototype._shouldReserveFunds = function() {
     reservations.push({building: 'airport', cost: 10000, urgency: comUrgency});
   }
 
-  // Power plant: reserve when capacity > 70%
-  var maxPower = census.coalPowerPop * COAL_CAPACITY + census.nuclearPowerPop * NUCLEAR_CAPACITY;
+  // Power plant: reserve when capacity > 70% (use map-based counts to avoid census lag)
+  var zc = this._zoneCounts || {};
+  var mapCoal = zc.coalPlants || 0;
+  var mapNuclear = zc.nuclearPlants || 0;
+  var maxPower = mapCoal * COAL_CAPACITY + mapNuclear * NUCLEAR_CAPACITY;
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
-  var estConsumption = totalZones * TILES_PER_ZONE + (census.coalPowerPop + census.nuclearPowerPop) * PLANT_OVERHEAD;
+  var estConsumption = totalZones * TILES_PER_ZONE + (mapCoal + mapNuclear) * PLANT_OVERHEAD;
   if (maxPower > 0 && estConsumption / maxPower > 0.70) {
     var powerUrgency = estConsumption / maxPower > 0.85 ? 'critical' : 'approaching';
     reservations.push({building: 'power plant', cost: 3000, urgency: powerUrgency});
@@ -1526,8 +1529,12 @@ AIAdvisor.prototype._analyzeBudgetActions = function(budget, census) {
 AIAdvisor.prototype._analyzePower = function(census, budget) {
   var recs = [];
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
-  var coalPlants = census.coalPowerPop;
-  var nuclearPlants = census.nuclearPowerPop;
+  // USE MAP-BASED COUNTS, not census. Census lags 1 cycle after building.
+  // Without this, the AI builds DUPLICATE coal plants: it places one, census
+  // hasn't updated yet, reads coalPowerPop=0, and builds another.
+  var zc = this._zoneCounts || {};
+  var coalPlants = zc.coalPlants || 0;
+  var nuclearPlants = zc.nuclearPlants || 0;
   var maxPower = coalPlants * COAL_CAPACITY + nuclearPlants * NUCLEAR_CAPACITY;
 
   // No zones yet - no power needed
@@ -1572,7 +1579,7 @@ AIAdvisor.prototype._analyzePower = function(census, budget) {
       recs.push({
         priority: PRIORITIES.POWER + 5,
         message: 'Power ' + Math.round(utilization * 100) + '% (' +
-          zonesUntilFull + ' zones left). Building 2nd coal plant.',
+          zonesUntilFull + ' zones left). Building coal plant.',
         action: { type: 'build', tool: 'coal' }
       });
     } else {
@@ -1691,19 +1698,21 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
     return recs;
   }
 
-  // Don't build zones if power can't handle more — but DO recommend building power.
-  // OLD: Returned a message with NO ACTION, leaving the AI with nothing to execute.
-  // NEW: Include an action to build coal/nuclear so the AI isn't stuck.
-  var maxPower = census.coalPowerPop * COAL_CAPACITY + census.nuclearPowerPop * NUCLEAR_CAPACITY;
+  // Don't build zones if power can't handle more.
+  // NO ACTION here — _analyzePower() handles power plant builds at higher priority (115 vs 85).
+  // This gate only prevents wasting money on zones that can't be powered.
+  // Uses map-based counts (not census) to avoid census lag issues.
+  var zc = this._zoneCounts || {};
+  var mapCoal = zc.coalPlants || 0;
+  var mapNuclear = zc.nuclearPlants || 0;
+  var maxPower = mapCoal * COAL_CAPACITY + mapNuclear * NUCLEAR_CAPACITY;
   var estConsumption = totalZones * TILES_PER_ZONE +
-    (census.coalPowerPop + census.nuclearPowerPop) * PLANT_OVERHEAD;
+    (mapCoal + mapNuclear) * PLANT_OVERHEAD;
   if (maxPower > 0 && estConsumption > maxPower * 0.90) {
-    var powerTool = (census.coalPowerPop >= 2 && totalZones >= NUCLEAR_MIN_ZONES) ? 'nuclear' : 'coal';
     recs.push({
       priority: PRIORITIES.ZONE_DEMAND + 5,
       message: 'Power near capacity (' + Math.round(estConsumption / maxPower * 100) +
-        '%). Building ' + powerTool + ' plant before adding zones.',
-      action: { type: 'build', tool: powerTool }
+        '%). Need plant before adding zones.'
     });
     return recs;
   }
@@ -1951,7 +1960,12 @@ AIAdvisor.prototype._analyzeServices = function(census, budget) {
   // Police station costs $500 + $100/yr, but prevents crime→landValue→crime spiral.
   // In early game, crime is low (few people = low density), so delay is ACCEPTABLE.
   // But once crimeAverage > 40, the ROI is clearly positive.
-  if (census.policeStationPop === 0 && canAfford) {
+  // Use map-based counts (not census) to prevent census-lag duplicate builds.
+  var zc = this._zoneCounts || {};
+  var mapPolice = zc.policeStations || 0;
+  var mapFire = zc.fireStations || 0;
+
+  if (mapPolice === 0 && canAfford) {
     var policeROI = this._computeBuildingROI('police');
     var crimeAcceptable = this._isPenaltyAcceptable('no_police', census.crimeAverage);
     if (!crimeAcceptable || policeROI > 30) {
@@ -1970,7 +1984,7 @@ AIAdvisor.prototype._analyzeServices = function(census, budget) {
   // Station costs $500 + $100/yr. Also: fire coverage boosts score multiplier (up to 10%).
   // In early game, fires are rare (random events), so delay is ACCEPTABLE.
   // But the station pays for itself via the coverage score multiplier once pop > 40.
-  if (census.fireStationPop === 0 && canAfford) {
+  if (mapFire === 0 && canAfford) {
     var fireROI = this._computeBuildingROI('fire');
     var fireAcceptable = this._isPenaltyAcceptable('no_fire_station', census.firePop);
     if (!fireAcceptable || fireROI > 20 || census.firePop > 0) {
@@ -2002,7 +2016,7 @@ AIAdvisor.prototype._analyzeServices = function(census, budget) {
 
   // --- Active fire emergency ---
   if (census.firePop > 0) {
-    if (census.fireStationPop === 0 && canAfford) {
+    if (mapFire === 0 && canAfford) {
       recs.push({
         priority: PRIORITIES.SERVICES + 15,
         message: census.firePop + ' active fires! Need fire station urgently.',
@@ -2586,8 +2600,11 @@ AIAdvisor.prototype.findBestZoneLocation = function(toolName) {
   var bestScore = -Infinity;
   var bestX = -1, bestY = -1;
 
-  for (var y = 2; y < map.height - 2; y += 2) {
-    for (var x = 2; x < map.width - 2; x += 2) {
+  // Step=1 to check EVERY position. Step=2 missed all grid-aligned positions
+  // when gx was odd (scan hit only even x, grid positions were all odd).
+  // Cost: ~12k positions vs ~3k, but _isAreaClear rejects most in 9 tile reads. <1ms.
+  for (var y = 1; y < map.height - 1; y++) {
+    for (var x = 1; x < map.width - 1; x++) {
       if (!this._isAreaClear(x - 1, y - 1, 3)) continue;
 
       var score = this._scoreZoneLocation(x, y, toolName);
@@ -3068,13 +3085,18 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
 
   switch (toolName) {
     case 'residential':
-      // === PROACTIVE POLLUTION CHECK ===
+      // === POLLUTION CHECK ===
       // From residential.js:121: pollution > 128 = zone CANNOT grow AT ALL.
-      // Use predicted pollution (includes future industrial/plant emissions)
-      // not just current blockMap value, so we never place into a future dead zone.
+      // Hard gate: use ACTUAL blockMap pollution (game engine truth).
+      // The prediction model overestimates by 2-5x (exponential decay doesn't match
+      // the game's 2-pass block smoothing), so using it for the hard gate
+      // rejects valid locations. Use prediction only as a soft penalty.
+      if (pollution > SAFE_RESIDENTIAL_POLLUTION) return -9999;
+      // Soft penalty for predicted future pollution risk
       var predictedPollution = this._predictPollutionAt(x, y);
-      var effectivePollution = Math.max(pollution, predictedPollution);
-      if (effectivePollution > SAFE_RESIDENTIAL_POLLUTION) return -9999;
+      if (predictedPollution > pollution) {
+        score -= (predictedPollution - pollution) * 2;
+      }
       if (this._hasNearbyIndustrial(x, y, MIN_INDUSTRY_RESIDENTIAL_GAP)) return -9999;
 
       // === HARD GATE: TRAFFIC ROUTING CHECK ===
@@ -3087,7 +3109,7 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
 
       // Compute actual locationScore from source code formula:
       // evalResidential = min((landValue - pollution) * 32, 6000) - 3000
-      var netValue = landValue - effectivePollution;
+      var netValue = landValue - pollution;
       if (netValue < 0) netValue = 0;
       var locationScore = Math.min(netValue * 32, 6000) - 3000;
 
@@ -3384,15 +3406,27 @@ AIAdvisor.prototype._countNearbyZones = function(x, y, radius) {
 AIAdvisor.prototype._countZoneTypes = function() {
   var map = this.map;
   var res = 0, com = 0, ind = 0;
+  // Map-based counting: always accurate, unlike census which lags 1 cycle.
+  // Prevents duplicate builds (e.g., 2 coal plants) when census hasn't updated yet.
+  var coal = 0, nuclear = 0, fire = 0, police = 0;
   for (var y = 1; y < map.height - 1; y++) {
     for (var x = 1; x < map.width - 1; x++) {
       var tv = map.getTileValue(x, y);
       if (TileUtils.isResidential(tv)) res++;
       else if (TileUtils.isCommercial(tv)) com++;
       else if (TileUtils.isIndustrial(tv)) ind++;
+      // Power plants and services: zone center tiles (from tileValues.ts)
+      else if (tv === 750) coal++;          // POWERPLANT zone center
+      else if (tv === 816) nuclear++;       // NUCLEAR zone center
+      else if (tv === 765) fire++;          // FIRESTATION zone center
+      else if (tv === 774) police++;        // POLICESTATION zone center
     }
   }
-  this._zoneCounts = { res: res, com: com, ind: ind, total: res + com + ind };
+  this._zoneCounts = {
+    res: res, com: com, ind: ind, total: res + com + ind,
+    coalPlants: coal, nuclearPlants: nuclear,
+    fireStations: fire, policeStations: police
+  };
 };
 
 
