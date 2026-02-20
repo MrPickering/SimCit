@@ -296,7 +296,9 @@ AIAdvisor.prototype._hasNearbyConnectedRoad = function(x, y, radius) {
 AIAdvisor.prototype._findNearestConnectedRoad = function(x, y) {
   if (!this._connectedRoads) return null;
   var map = this.map;
-  for (var radius = 1; radius < 30; radius++) {
+  // Max search 12 tiles — if connected road is further, zone is too isolated.
+  // Old value of 30 caused expensive road-building into wilderness.
+  for (var radius = 1; radius <= 12; radius++) {
     for (var dy = -radius; dy <= radius; dy++) {
       for (var dx = -radius; dx <= radius; dx++) {
         if (Math.abs(dx) !== radius && Math.abs(dy) !== radius) continue;
@@ -3059,24 +3061,30 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   // Road adjacency is critical — from simulation source:
   // zones without road access fail traffic check → DEGRADE
   // MUST use connected road check — disconnected fragments don't count!
-  if (this._hasNearbyConnectedRoad(x, y, 2)) score += 150;
-  else if (this._hasNearbyConnectedRoad(x, y, 4)) score += 60;
-  else if (this._hasNearbyConnectedRoad(x, y, 8)) score += 10;
-  else return -9999;
+  // Also factor in ROAD COST: each tile of road costs $10-15.
+  // A location 8 tiles from a road = $80-120 just to connect.
+  if (this._hasNearbyConnectedRoad(x, y, 2)) score += 150;       // Adjacent, $0 road cost
+  else if (this._hasNearbyConnectedRoad(x, y, 4)) score += 60;   // ~$30-45 road cost
+  else if (this._hasNearbyConnectedRoad(x, y, 6)) score -= 30;   // ~$60-90 road cost
+  else return -9999; // Too far — road cost + risk too high
 
-  // === COMPACTNESS BONUS (DOMINANT FACTOR) ===
+  // === COMPACTNESS BONUS (DOMINANT — MUST OUTWEIGH ALL OTHER FACTORS) ===
   // A compact city EXPONENTIALLY outperforms a sprawling one:
   // - Traffic routes complete in fewer steps → zones don't degrade
   // - Power plants cover more zones → fewer plants needed
   // - Police/fire stations cover more zones → less maintenance
   // - Land value rises faster with nearby development
   // - Roads serve more zones → less road maintenance per zone
-  // Count existing zone centers within 6 tiles. Each nearby zone = +40 score.
-  // In a compact city (4-tile spacing), a location has ~4-6 neighbors → +160-240.
-  // An isolated location has 0 neighbors → +0. Difference: +160-240.
-  // This MUST dominate other factors to prevent sprawl.
+  // Count existing zone centers within 6 tiles. Each nearby zone = +80 score.
+  // In a compact city (4-tile spacing), a location has ~4-6 neighbors → +320-480.
+  // An isolated location has 0 neighbors → +0. Difference: +320-480.
+  // At +80/zone, even a location with perfect land value and no pollution
+  // CANNOT outscore a compact location with 3+ neighbors.
   var nearbyZones = this._countNearbyZones(x, y, 6);
-  score += nearbyZones * 40;
+  score += nearbyZones * 80;
+  // Isolation penalty: if NO zones nearby, this is frontier expansion.
+  // In early game, this should almost never happen.
+  if (nearbyZones === 0) score -= 100;
 
   // === WATER CROSSING PENALTY ===
   // If the straight-line path from this location to the city center crosses water,
@@ -3088,20 +3096,32 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
     if (waterCrossings > 0) score -= waterCrossings * 80;  // Each water tile = -80
   }
 
-  // === SPRAWL PENALTY (ZONE-TYPE AWARE) ===
-  // Penalize locations far from the grid origin (starter city center).
-  // Industrial zones get SOFTER penalty — they naturally go south of core (further away)
-  // and need more space. Residential/commercial get stronger penalty for compactness.
+  // === SPRAWL PENALTY (PHASE-ADAPTIVE) ===
+  // CRITICAL: The sprawl limit MUST scale with city size. In early game,
+  // the city is 6 zones — spreading them over 35 tiles creates unreachable
+  // zones the AI can't power or connect. A tight radius forces compact growth,
+  // which is then loosened as the city develops infrastructure to support it.
   if (this._plan.initialized) {
     var gx = this._plan.gridOriginX;
     var gy = this._plan.gridOriginY;
     var distFromCore = Math.abs(x - gx) + Math.abs(y - gy);
     var isIndustrial = (toolName === 'industrial');
-    // Industrial: softer penalty (1.5/tile vs 3/tile) and wider limits
+
+    // Phase-based hard cap — expands as city grows
+    var phase = this._getPhase();
+    var hardCap;
+    if (phase === 'bootstrap' || phase === 'early') {
+      hardCap = isIndustrial ? 20 : 15;
+    } else if (phase === 'growth') {
+      hardCap = isIndustrial ? 30 : 25;
+    } else {
+      hardCap = isIndustrial ? 45 : 35;
+    }
+    var accelThreshold = Math.round(hardCap * 0.6);
+
+    // Industrial: softer penalty (1.5/tile vs 3/tile)
     var basePenalty = isIndustrial ? 1.5 : 3;
     var accelPenalty = isIndustrial ? 3 : 6;
-    var accelThreshold = isIndustrial ? 25 : 20;
-    var hardCap = isIndustrial ? 45 : 35;
     score -= distFromCore * basePenalty;
     if (distFromCore > accelThreshold) score -= (distFromCore - accelThreshold) * accelPenalty;
     if (distFromCore > hardCap) return -9999;

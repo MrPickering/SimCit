@@ -1212,10 +1212,13 @@ AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
     startY = y + (dy > 0 ? half + 1 : -(half + 1));
   }
 
-  // Walk from start toward target, building roads
+  // Walk from start toward target, building roads.
+  // MAX 10 STEPS — if the road is further than this, the zone is too isolated
+  // and should have been rejected by scoring. Old value (20) caused expensive
+  // winding roads through forest that wasted hundreds of dollars.
   var cx = startX;
   var cy = startY;
-  var maxSteps = 20;
+  var maxSteps = 10;
   var roadsBuilt = 0;
   var reachedNetwork = false;
 
