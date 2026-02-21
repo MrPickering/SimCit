@@ -415,7 +415,7 @@ AIHelper.prototype._executeNextAction = function() {
       break;
 
     case 'cleanup_abandoned':
-      success = this._cleanupAbandonedZone();
+      success = this._cleanupAbandonedZone(action.x, action.y);
       description = 'Bulldozing abandoned zone';
       break;
 
@@ -933,13 +933,16 @@ AIHelper.prototype._buildZone = function(toolName) {
       return false; // No blacklist — just skip this cycle
     }
 
-    // If road isn't adjacent, verify no water in the path
+    // If road isn't adjacent, verify no water or forest in the path
     if (!this.advisor._hasAdjacentConnectedRoad(loc.x, loc.y)) {
       var nearestRoad = this.advisor._findNearestConnectedRoad(loc.x, loc.y);
       if (nearestRoad) {
         var waterInPath = this.advisor._countWaterCrossings(
           loc.x, loc.y, nearestRoad.x, nearestRoad.y);
-        if (waterInPath > 0) return false; // No blacklist — water is permanent, scoring handles it
+        if (waterInPath > 0) return false; // No blacklist — water is permanent
+        var forestInPath = this.advisor._countForestInPath(
+          loc.x, loc.y, nearestRoad.x, nearestRoad.y);
+        if (forestInPath > 1) return false; // No blacklist — forest blocks road building
       }
     }
   }
@@ -1112,11 +1115,19 @@ AIHelper.prototype._bulldozeRubble = function() {
 // These zones will never grow and waste map space. Better to clear them
 // and let the AI build in a location that's actually connected.
 
-AIHelper.prototype._cleanupAbandonedZone = function() {
+AIHelper.prototype._cleanupAbandonedZone = function(targetX, targetY) {
   var budget = this.simulation.budget;
   if (budget.totalFunds < 50) return false;
 
-  var abandoned = this.advisor.findAbandonedZone();
+  // Use specific coordinates if provided (from health audit), otherwise scan.
+  // Health audit already identified the exact zone — don't re-scan, which
+  // could miss zones if grid parity doesn't match findAbandonedZone's scan.
+  var abandoned;
+  if (targetX !== undefined && targetY !== undefined) {
+    abandoned = { x: targetX, y: targetY };
+  } else {
+    abandoned = this.advisor.findAbandonedZone();
+  }
   if (!abandoned) return false;
 
   var bulldozerTool = this.tools.bulldozer;
@@ -1233,8 +1244,10 @@ AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
 
   // Walk from start toward target, building roads.
   // MAX 10 STEPS — if the road is further than this, the zone is too isolated
-  // and should have been rejected by scoring. Old value (20) caused expensive
-  // winding roads through forest that wasted hundreds of dollars.
+  // and should have been rejected by scoring.
+  // ONLY BUILD ON DIRT — never bulldoze forest for roads. Forest tiles (21-43)
+  // create natural barriers. Roads through forest cost $30+ per tile (bulldoze
+  // + road), look terrible, and create spaghetti networks through wilderness.
   var cx = startX;
   var cy = startY;
   var maxSteps = 10;
@@ -1243,17 +1256,44 @@ AIHelper.prototype._ensureRoadAccess = function(x, y, size) {
 
   for (var step = 0; step < maxSteps; step++) {
     if (budget.totalFunds < 10) break;
+    if (cx < 0 || cy < 0 || cx >= map.width || cy >= map.height) break;
+
+    var tv = map.getTileValue(cx, cy);
 
     // Check if we've reached the road network
-    if (TileUtils.isRoad(map.getTileValue(cx, cy))) {
+    if (TileUtils.isRoad(tv)) {
       reachedNetwork = true;
       break;
     }
 
-    // Build road at current position
-    if (cx >= 0 && cy >= 0 && cx < map.width && cy < map.height) {
+    // Only build on DIRT (empty) tiles — don't bulldoze through forest or anything else
+    if (tv === TileValues.DIRT) {
       if (this._buildRoad(cx, cy)) roadsBuilt++;
+    } else if (tv >= TileValues.WOODS_LOW && tv <= TileValues.WOODS_HIGH) {
+      // Forest blocking the path — try alternate direction before giving up
+      var ddx2 = nearestRoad.x - cx;
+      var ddy2 = nearestRoad.y - cy;
+      var altX, altY;
+      if (Math.abs(ddx2) >= Math.abs(ddy2)) {
+        altX = cx; altY = cy + (ddy2 >= 0 ? 1 : -1);
+      } else {
+        altX = cx + (ddx2 >= 0 ? 1 : -1); altY = cy;
+      }
+      if (altX >= 0 && altY >= 0 && altX < map.width && altY < map.height) {
+        var altTv = map.getTileValue(altX, altY);
+        if (altTv === TileValues.DIRT) {
+          cx = altX; cy = altY;
+          if (this._buildRoad(cx, cy)) roadsBuilt++;
+          continue;
+        } else if (TileUtils.isRoad(altTv)) {
+          reachedNetwork = true; break;
+        }
+      }
+      break; // Both directions blocked by forest — stop
+    } else if (tv >= TileValues.WATER_LOW && tv <= TileValues.WATER_HIGH) {
+      break; // Water — can't build here at all
     }
+    // else: some other structure — skip over it
 
     // Move toward target
     var ddx = nearestRoad.x - cx;
@@ -1378,7 +1418,7 @@ AIHelper.prototype._executeAction = function(rec) {
     case 'expand_grid': return this._expandGrid(a.zoneType);
     case 'build_park': return this._buildParkAt(a.x, a.y);
     case 'reduce_pollution': return this._reducePollution();
-    case 'cleanup_abandoned': return this._cleanupAbandonedZone();
+    case 'cleanup_abandoned': return this._cleanupAbandonedZone(a.x, a.y);
     default: return false;
   }
 };

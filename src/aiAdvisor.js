@@ -328,8 +328,10 @@ AIAdvisor.prototype.findAbandonedZone = function() {
   var worst = null;
   var worstScore = 0;
 
-  for (var y = 1; y < map.height - 1; y += 2) {
-    for (var x = 1; x < map.width - 1; x += 2) {
+  // Scan EVERY tile (step 1). Old step-2 scan starting at odd coordinates
+  // missed all grid-aligned zones at even coordinates — 50% of zones invisible.
+  for (var y = 1; y < map.height - 1; y++) {
+    for (var x = 1; x < map.width - 1; x++) {
       var tile = map.getTile(x, y);
       if (!tile.isZone()) continue;
 
@@ -2841,9 +2843,12 @@ AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
       ny = cy + (dy > 0 ? 1 : -1);
     }
 
+    // Only traverse DIRT (empty) or existing roads — NEVER bulldoze forest.
+    // Old code used canBulldoze() which included forest tiles (21-43), causing
+    // roads to be planned through wilderness. Roads should follow clear land.
     if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
       var tv = map.getTileValue(nx, ny);
-      if (tv === TileValues.DIRT || TileUtils.canBulldoze(tv) || TileUtils.isRoad(tv)) {
+      if (tv === TileValues.DIRT || TileUtils.isRoad(tv)) {
         if (!TileUtils.isRoad(tv)) {
           path.push({ x: nx, y: ny });
         }
@@ -2853,6 +2858,7 @@ AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
       }
     }
 
+    // Try alternate direction
     if (Math.abs(dx) >= Math.abs(dy)) {
       nx = cx;
       ny = cy + (dy !== 0 ? (dy > 0 ? 1 : -1) : 1);
@@ -2862,9 +2868,9 @@ AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
     }
 
     if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
-      var tv = map.getTileValue(nx, ny);
-      if (tv === TileValues.DIRT || TileUtils.canBulldoze(tv) || TileUtils.isRoad(tv)) {
-        if (!TileUtils.isRoad(tv)) {
+      var tv2 = map.getTileValue(nx, ny);
+      if (tv2 === TileValues.DIRT || TileUtils.isRoad(tv2)) {
+        if (!TileUtils.isRoad(tv2)) {
           path.push({ x: nx, y: ny });
         }
         cx = nx;
@@ -2873,7 +2879,7 @@ AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
       }
     }
 
-    break;
+    break; // Both directions blocked — stop
   }
 
   return path;
@@ -2911,7 +2917,8 @@ AIAdvisor.prototype.findRoadToConnect = function() {
         var ry = y + dirs[d][1];
         if (rx >= 0 && ry >= 0 && rx < width && ry < height) {
           var tv = map.getTileValue(rx, ry);
-          if (tv === TileValues.DIRT || TileUtils.canBulldoze(tv)) {
+          // Only build on DIRT — don't bulldoze forest for stub roads
+          if (tv === TileValues.DIRT) {
             return [{ x: rx, y: ry }];
           }
         }
@@ -3115,6 +3122,19 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   else if (this._hasNearbyConnectedRoad(x, y, 4)) score += 60;   // ~$30-45 road cost
   else if (this._hasNearbyConnectedRoad(x, y, 6)) score -= 30;   // ~$60-90 road cost
   else return -9999; // Too far — road cost + risk too high
+
+  // === FOREST BLOCKING CHECK ===
+  // If road isn't adjacent, verify the path to it is clear of forest.
+  // Roads can only be built on DIRT — forest blocks road construction.
+  // A zone 4 tiles from a road with forest in between = zombie zone.
+  if (!this._hasNearbyConnectedRoad(x, y, 2)) {
+    var nearRoad = this._findNearestConnectedRoad(x, y);
+    if (nearRoad) {
+      var forestInPath = this._countForestInPath(x, y, nearRoad.x, nearRoad.y);
+      if (forestInPath > 1) return -9999; // Forest blocks the road path
+      if (forestInPath === 1) score -= 100; // One tree might be bulldozable but risky
+    }
+  }
 
   // === COMPACTNESS BONUS (DOMINANT — MUST OUTWEIGH ALL OTHER FACTORS) ===
   // A compact city EXPONENTIALLY outperforms a sprawling one:
@@ -3707,6 +3727,34 @@ AIAdvisor.prototype._countWaterCrossings = function(x1, y1, x2, y2) {
 };
 
 
+// Count forest tiles in straight-line path between two points.
+// Used to reject zone locations where road building would require
+// bulldozing through forest. Roads should follow clear land, not
+// plow through wilderness.
+AIAdvisor.prototype._countForestInPath = function(x1, y1, x2, y2) {
+  var map = this.map;
+  var dx = x2 - x1;
+  var dy = y2 - y1;
+  var steps = Math.max(Math.abs(dx), Math.abs(dy));
+  if (steps === 0) return 0;
+
+  var forestCount = 0;
+  var sx = dx / steps;
+  var sy = dy / steps;
+
+  for (var i = 0; i <= steps; i++) {
+    var cx = Math.round(x1 + sx * i);
+    var cy = Math.round(y1 + sy * i);
+    if (cx < 0 || cy < 0 || cx >= map.width || cy >= map.height) continue;
+    var tv = map.getTileValue(cx, cy);
+    if (tv >= TileValues.WOODS_LOW && tv <= TileValues.WOODS_HIGH) {
+      forestCount++;
+    }
+  }
+  return forestCount;
+};
+
+
 // Count buildable (non-water) tiles in a square radius around a point.
 // Used to detect tiny peninsulas and water-edge slivers where zones would be stranded.
 // Water tiles: values 2-20 (RIVER through LASTRIVEDGE).
@@ -4160,7 +4208,7 @@ AIAdvisor.prototype.getTopHealthAction = function() {
         priority: PRIORITIES.ROAD_CONNECT + 5, // Higher than normal infrastructure
         message: 'HEALTH AUDIT: ' + top.zoneType + ' at (' + top.x + ',' + top.y +
           ') is dead (' + top.problems[0].type + '). Bulldozing.',
-        action: { type: 'cleanup_abandoned' }
+        action: { type: 'cleanup_abandoned', x: top.x, y: top.y }
       };
 
     case 'build_road':
