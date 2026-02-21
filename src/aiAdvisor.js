@@ -1640,10 +1640,11 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
   var phase = this._getPhase();
 
-  // POWER CRISIS GATE: If >30% of zones are unpowered, STOP building new zones.
-  // The AI must fix its existing infrastructure before adding more broken zones.
-  // This prevents the death spiral: build zone → can't power → build more → can't power.
-  if (this._powerCrisis && phase !== 'bootstrap') {
+  // POWER CRISIS GATE: If >30% of zones are unpowered AND city has enough
+  // zones to judge, STOP building new ones. Don't apply to small cities —
+  // after starter city build, census lag means zones appear unpowered for
+  // a cycle or two. With only 6-8 zones, 2 unpowered = 33% = crisis triggered.
+  if (this._powerCrisis && phase !== 'bootstrap' && totalZones > 12) {
     recs.push({
       priority: PRIORITIES.ZONE_DEMAND,
       message: 'POWER CRISIS: Too many unpowered zones. Fix infrastructure before building.'
@@ -3111,7 +3112,7 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
     var phase = this._getPhase();
     var hardCap;
     if (phase === 'bootstrap' || phase === 'early') {
-      hardCap = isIndustrial ? 20 : 15;
+      hardCap = isIndustrial ? 25 : 20;
     } else if (phase === 'growth') {
       hardCap = isIndustrial ? 30 : 25;
     } else {
@@ -4155,14 +4156,14 @@ AIAdvisor.prototype.getTopHealthAction = function() {
 };
 
 
-// Blacklist a location AND its surrounding area where a zone failed.
-// OLD: Only blacklisted exact (x,y). AI placed at (x+1,y) next cycle — same
-// bad area, same failure, more wasted money. NOW: blacklist a 7x7 area
-// (zone footprint 3x3 + 2-tile buffer) so the entire vicinity is blocked.
+// Blacklist a location AND its immediate vicinity where a zone failed.
+// Covers the 3x3 zone footprint + 1-tile buffer = 5x5 area (25 tiles).
+// Expires after 20 audit ticks (~60 action cycles) so locations reopen
+// as the city builds infrastructure that may make them viable.
 AIAdvisor.prototype.blacklistLocation = function(x, y) {
-  var expiry = this._auditTick + 50;
-  for (var dy = -3; dy <= 3; dy++) {
-    for (var dx = -3; dx <= 3; dx++) {
+  var expiry = this._auditTick + 20;
+  for (var dy = -2; dy <= 2; dy++) {
+    for (var dx = -2; dx <= 2; dx++) {
       this._blacklistedLocations[(x + dx) + ',' + (y + dy)] = expiry;
     }
   }

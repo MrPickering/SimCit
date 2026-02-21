@@ -923,37 +923,23 @@ AIHelper.prototype._buildZone = function(toolName) {
   if (!loc || loc.score < -100) return false;
 
   // === PRE-PLACEMENT VALIDATION (before spending any money) ===
-  // Step 1: Must have ADJACENT connected road (within 2 tiles).
-  // If there's a connected road within 2, _ensureRoadAccess will succeed
-  // trivially. If road is 3-6 tiles away, we can build a short path.
-  // Anything further = too risky and expensive.
+  // Must have a connected road within 6 tiles (matches scoring threshold).
+  // If closer, more likely to succeed. If further, scoring already rejected it.
+  // Don't blacklist on pre-check failure — the location may become viable
+  // when the city builds more roads. Only blacklist on POST-placement failure.
   var half = Math.floor(size / 2);
   if (size <= 3) {
-    var hasAdjacentRoad = this.advisor._hasAdjacentConnectedRoad(loc.x, loc.y);
-    var hasNearRoad = hasAdjacentRoad || this.advisor._hasNearbyConnectedRoad(loc.x, loc.y, 4);
-
-    if (!hasNearRoad) {
-      // No connected road within 4 tiles. DON'T place — blacklist and move on.
-      this.advisor.blacklistLocation(loc.x, loc.y);
-      return false;
+    if (!this.advisor._hasNearbyConnectedRoad(loc.x, loc.y, 6)) {
+      return false; // No blacklist — just skip this cycle
     }
 
-    // Step 2: If road is nearby but not adjacent, verify the PATH is clear.
-    // Check that we can actually walk from zone edge to the road without
-    // crossing water or impassable terrain.
-    if (!hasAdjacentRoad) {
+    // If road isn't adjacent, verify no water in the path
+    if (!this.advisor._hasAdjacentConnectedRoad(loc.x, loc.y)) {
       var nearestRoad = this.advisor._findNearestConnectedRoad(loc.x, loc.y);
-      if (!nearestRoad) {
-        this.advisor.blacklistLocation(loc.x, loc.y);
-        return false;
-      }
-      // Check for water in the path
-      var waterInPath = this.advisor._countWaterCrossings(
-        loc.x, loc.y, nearestRoad.x, nearestRoad.y);
-      if (waterInPath > 0) {
-        // Can't build roads across water — don't even try
-        this.advisor.blacklistLocation(loc.x, loc.y);
-        return false;
+      if (nearestRoad) {
+        var waterInPath = this.advisor._countWaterCrossings(
+          loc.x, loc.y, nearestRoad.x, nearestRoad.y);
+        if (waterInPath > 0) return false; // No blacklist — water is permanent, scoring handles it
       }
     }
   }
