@@ -1167,6 +1167,14 @@ AIAdvisor.prototype.findStarterLocation = function() {
   var cx = this.map.cityCentreX;
   var cy = this.map.cityCentreY;
 
+  // Pick the BEST starter location, not just the first clear one.
+  // The old code grabbed the first 15x15 clear area near center — on maps
+  // where center is near water, the starter city ended up on a water/forest
+  // boundary with nowhere to expand. Now we score candidates by buildable
+  // land in the EXPANSION area (31x31 = radius 15) and pick the best.
+  var bestCandidate = null;
+  var bestScore = -Infinity;
+
   // Need area for T-grid: 15 wide x 15 tall
   // Wider to fit grid-aligned zones at gx-6, gx-2, gx+2, gx+6
   // Layout: (gx-7, gy-3) to (gx+7, gy+11)
@@ -1176,28 +1184,67 @@ AIAdvisor.prototype.findStarterLocation = function() {
         if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
         var gx = cx + dx;
         var gy = cy + dy;
-        if (this._isAreaClear(gx - 7, gy - 3, 15, 15)) {
-          return { x: gx, y: gy };
+        if (!this._isAreaClear(gx - 7, gy - 3, 15, 15)) continue;
+
+        // Check expansion area: how much buildable land surrounds this spot?
+        // Radius 15 → 31x31 = 961 tiles. City needs room to grow.
+        var landCount = this._countBuildableTiles(gx, gy, 15);
+        var landRatio = landCount / 961;
+
+        // Reject locations with less than 65% buildable land — not enough
+        // room to expand without running into water on every side
+        if (landRatio < 0.65) continue;
+
+        // Score: prioritize buildable land, penalize distance from center
+        var dist = Math.abs(dx) + Math.abs(dy);
+        var score = landCount - dist * 10;
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestCandidate = { x: gx, y: gy };
         }
       }
     }
-  }
 
-  // Fallback: smaller area
-  for (var r = 0; r < 40; r++) {
-    for (var dy = -r; dy <= r; dy++) {
-      for (var dx = -r; dx <= r; dx++) {
-        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
-        var gx = cx + dx;
-        var gy = cy + dy;
-        if (this._isAreaClear(gx - 6, gy - 3, 13, 12)) {
-          return { x: gx, y: gy };
-        }
-      }
+    // Early exit: if we found a candidate with >85% buildable land, take it
+    // No need to search further from center
+    if (bestCandidate && bestScore > 961 * 0.85) {
+      return bestCandidate;
     }
   }
 
-  return null;
+  if (bestCandidate) return bestCandidate;
+
+  // Fallback: smaller footprint (13x12), lower land requirement (50%)
+  bestScore = -Infinity;
+  for (var r2 = 0; r2 < 40; r2++) {
+    for (var dy2 = -r2; dy2 <= r2; dy2++) {
+      for (var dx2 = -r2; dx2 <= r2; dx2++) {
+        if (Math.abs(dx2) !== r2 && Math.abs(dy2) !== r2) continue;
+        var gx2 = cx + dx2;
+        var gy2 = cy + dy2;
+        if (!this._isAreaClear(gx2 - 6, gy2 - 3, 13, 12)) continue;
+
+        var landCount2 = this._countBuildableTiles(gx2, gy2, 12);
+        var landRatio2 = landCount2 / 625;
+        if (landRatio2 < 0.50) continue;
+
+        var dist2 = Math.abs(dx2) + Math.abs(dy2);
+        var score2 = landCount2 - dist2 * 10;
+
+        if (score2 > bestScore) {
+          bestScore = score2;
+          bestCandidate = { x: gx2, y: gy2 };
+        }
+      }
+    }
+
+    if (bestCandidate && bestScore > 625 * 0.80) {
+      return bestCandidate;
+    }
+  }
+
+  return bestCandidate;
 };
 
 
