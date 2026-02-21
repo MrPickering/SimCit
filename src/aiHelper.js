@@ -896,6 +896,13 @@ AIHelper.prototype._buildStarterCity = function() {
 
 
 // ---- Zone building with power connectivity ----
+//
+// PRINCIPLE: Validate BEFORE spending money.
+// OLD: Place zone ($100) → build roads ($50-150) → check if connected →
+//   if not, bulldoze ($1) → blacklist point → AI places next door → repeat.
+//   Each failed attempt wastes $150-250.
+// NEW: Check connectivity FIRST. Only place the zone if we're confident
+//   it will succeed. Blacklist entire area on failure, not just one point.
 
 AIHelper.prototype._buildZone = function(toolName) {
   var budget = this.simulation.budget;
@@ -915,28 +922,55 @@ AIHelper.prototype._buildZone = function(toolName) {
 
   if (!loc || loc.score < -100) return false;
 
-  // Pre-check: is there a connected road nearby that we can reach?
-  // If not, don't waste money on a zone that will be stranded.
-  // CRITICAL: Only check CONNECTED roads — disconnected fragments don't count.
-  if (size <= 3 && !this.advisor._hasNearbyConnectedRoad(loc.x, loc.y, 10)) {
-    return false;
+  // === PRE-PLACEMENT VALIDATION (before spending any money) ===
+  // Step 1: Must have ADJACENT connected road (within 2 tiles).
+  // If there's a connected road within 2, _ensureRoadAccess will succeed
+  // trivially. If road is 3-6 tiles away, we can build a short path.
+  // Anything further = too risky and expensive.
+  var half = Math.floor(size / 2);
+  if (size <= 3) {
+    var hasAdjacentRoad = this.advisor._hasAdjacentConnectedRoad(loc.x, loc.y);
+    var hasNearRoad = hasAdjacentRoad || this.advisor._hasNearbyConnectedRoad(loc.x, loc.y, 4);
+
+    if (!hasNearRoad) {
+      // No connected road within 4 tiles. DON'T place — blacklist and move on.
+      this.advisor.blacklistLocation(loc.x, loc.y);
+      return false;
+    }
+
+    // Step 2: If road is nearby but not adjacent, verify the PATH is clear.
+    // Check that we can actually walk from zone edge to the road without
+    // crossing water or impassable terrain.
+    if (!hasAdjacentRoad) {
+      var nearestRoad = this.advisor._findNearestConnectedRoad(loc.x, loc.y);
+      if (!nearestRoad) {
+        this.advisor.blacklistLocation(loc.x, loc.y);
+        return false;
+      }
+      // Check for water in the path
+      var waterInPath = this.advisor._countWaterCrossings(
+        loc.x, loc.y, nearestRoad.x, nearestRoad.y);
+      if (waterInPath > 0) {
+        // Can't build roads across water — don't even try
+        this.advisor.blacklistLocation(loc.x, loc.y);
+        return false;
+      }
+    }
   }
 
+  // === PLACEMENT (now confident this will work) ===
   tool.doTool(loc.x, loc.y, this.blockMaps);
   if (tool.result === tool.TOOLRESULT_OK) {
     tool.modifyIfEnoughFunding(budget);
     if (tool.result !== tool.TOOLRESULT_NO_MONEY) {
-      // Ensure road access — builds toward CONNECTED network
+      // Build road and power connections
       this._ensureRoadAccess(loc.x, loc.y, size);
-      // Wire the MINIMUM path to connect this zone to the power grid
       this._ensurePowerAccess(loc.x, loc.y, size);
 
-      // MANDATORY post-placement verification.
-      // _ensureRoadAccess() may return true based on stale road network data
-      // from the analyze() cycle start. ALWAYS rebuild and verify.
+      // Post-placement verification (safety net — should rarely fail now)
       this.advisor._buildRoadNetworkMap();
       if (!this.advisor._hasAdjacentConnectedRoad(loc.x, loc.y)) {
-        // Zone is stranded — bulldoze the zombie to free the land
+        // Still failed despite pre-check — bulldoze and blacklist area
         var bulldozerTool = this.tools.bulldozer;
         bulldozerTool.doTool(loc.x, loc.y, this.blockMaps);
         if (bulldozerTool.result === bulldozerTool.TOOLRESULT_OK) {
@@ -944,7 +978,6 @@ AIHelper.prototype._buildZone = function(toolName) {
         } else {
           bulldozerTool.clear();
         }
-        // BLACKLIST this location so AI doesn't repeat the mistake
         this.advisor.blacklistLocation(loc.x, loc.y);
         return false;
       }

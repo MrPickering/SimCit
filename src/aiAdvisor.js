@@ -4155,12 +4155,17 @@ AIAdvisor.prototype.getTopHealthAction = function() {
 };
 
 
-// Blacklist a location where a zone failed. Prevents the AI from
-// repeating the same mistake at the same spot.
+// Blacklist a location AND its surrounding area where a zone failed.
+// OLD: Only blacklisted exact (x,y). AI placed at (x+1,y) next cycle — same
+// bad area, same failure, more wasted money. NOW: blacklist a 7x7 area
+// (zone footprint 3x3 + 2-tile buffer) so the entire vicinity is blocked.
 AIAdvisor.prototype.blacklistLocation = function(x, y) {
-  // Blacklist expires after 50 audit ticks (~150 action cycles)
-  // so locations become available again as city infrastructure grows.
-  this._blacklistedLocations[x + ',' + y] = this._auditTick + 50;
+  var expiry = this._auditTick + 50;
+  for (var dy = -3; dy <= 3; dy++) {
+    for (var dx = -3; dx <= 3; dx++) {
+      this._blacklistedLocations[(x + dx) + ',' + (y + dy)] = expiry;
+    }
+  }
 };
 
 AIAdvisor.prototype.isLocationBlacklisted = function(x, y) {
