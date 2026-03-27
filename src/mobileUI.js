@@ -83,6 +83,21 @@ MobileUI.prototype._createMobileInfoBar = function() {
           <div class="info-label">SCORE</div>
           <div class="info-value" id="mobileScore">0</div>
         </div>
+        <div class="info-item info-demand-mobile">
+          <div class="info-label">RCI</div>
+          <div class="info-value">
+            <span id="mobileDemandR" class="mobile-demand mobile-demand-r">R</span>
+            <span id="mobileDemandC" class="mobile-demand mobile-demand-c">C</span>
+            <span id="mobileDemandI" class="mobile-demand mobile-demand-i">I</span>
+          </div>
+        </div>
+        <div class="info-item info-ai-perf-mobile" id="mobileAiPerfBadge">
+          <div class="info-label">AI</div>
+          <div class="info-value">
+            <span id="mobileAiGrade">--</span>
+            <span id="mobileAiTrend"></span>
+          </div>
+        </div>
       </div>
     </div>
   `;
@@ -330,6 +345,33 @@ MobileUI.prototype.syncWithDesktop = function() {
     observer.observe(dateEl, config);
     observer.observe(scoreEl, config);
   }
+
+  // Sync demand indicators
+  var demandR = document.getElementById('demandR');
+  var demandC = document.getElementById('demandC');
+  var demandI = document.getElementById('demandI');
+
+  if (demandR && demandC && demandI) {
+    var demandObserver = new MutationObserver(function() {
+      self._syncDemandClass('demandR', 'mobileDemandR');
+      self._syncDemandClass('demandC', 'mobileDemandC');
+      self._syncDemandClass('demandI', 'mobileDemandI');
+    });
+
+    var attrConfig = { attributes: true, attributeFilter: ['class'] };
+    demandObserver.observe(demandR, attrConfig);
+    demandObserver.observe(demandC, attrConfig);
+    demandObserver.observe(demandI, attrConfig);
+  }
+};
+
+MobileUI.prototype._syncDemandClass = function(srcId, destId) {
+  var src = document.getElementById(srcId);
+  var dest = document.getElementById(destId);
+  if (!src || !dest) return;
+  dest.className = dest.className.replace(/demand-(high|low)/g, '').trim();
+  if (src.classList.contains('demand-high')) dest.classList.add('demand-high');
+  if (src.classList.contains('demand-low')) dest.classList.add('demand-low');
 };
 
 export { MobileUI };

@@ -80,27 +80,30 @@
             </div>
           </form>
         </div>
-        <div id="infobar" class="alignCenter leftedge open width140 padding10 controlShadow mintcream z1 initialHidden">
-          <div class="inner">
-            <div class="semibold chunk">
-              <span id="name">Your Name Here</span>
-            </div>
-            <div>
-              <span id="date">Jan 1900</span>
-            </div>
-            <div class="elided">
-              Funds $<span id="funds">20000</span>
-            </div>
-            <div class="elided">
-              Score: <span id="score">0</span>
-            </div>
-            <div>
-              <span id="cclass">VILLAGE</span>
-            </div>
-            <div class="elided">
-              Population:<br /> <span id="population">0</span>
-            </div>
-          </div>
+        <div id="infobar" class="initialHidden">
+          <span class="info-item info-name" id="name">Your Name Here</span>
+          <span class="info-sep"></span>
+          <span class="info-item" id="date">Jan 1900</span>
+          <span class="info-sep"></span>
+          <span class="info-item"><span class="info-label">Funds</span> $<span id="funds">20000</span></span>
+          <span class="info-sep"></span>
+          <span class="info-item"><span class="info-label">Pop</span> <span id="population">0</span></span>
+          <span class="info-sep"></span>
+          <span class="info-item"><span class="info-label">Score</span> <span id="score">0</span></span>
+          <span class="info-sep"></span>
+          <span class="info-item info-class" id="cclass">VILLAGE</span>
+          <span class="info-sep"></span>
+          <span class="info-item info-demand">
+            <span id="demandR" class="demand demand-r" title="Residential Demand">R</span>
+            <span id="demandC" class="demand demand-c" title="Commercial Demand">C</span>
+            <span id="demandI" class="demand demand-i" title="Industrial Demand">I</span>
+          </span>
+          <span class="info-sep"></span>
+          <span class="info-item info-ai-perf" id="aiPerfBadge" style="display:none">
+            <span class="info-label">AI</span>
+            <span id="aiGrade" class="ai-grade">--</span>
+            <span id="aiTrend" class="ai-trend"></span>
+          </span>
         </div>
         <div id="miscButtons" class="alignCenter leftedge open controlShadow width140 padding10 mintcream z1 initialHidden">
           <div class="inner">
@@ -184,6 +187,7 @@
           <div id="aiPanel" class="ai-panel ai-hidden">
             <div class="ai-header">AI City Advisor</div>
             <div id="aiStatsContent" class="ai-stats"></div>
+            <div id="aiPerformance" class="ai-performance"></div>
             <div class="ai-section-title">Recommendations</div>
             <ul id="aiAdviceList" class="ai-advice-list">
               <li class="ai-advice-item">Start a game to get AI advice.</li>

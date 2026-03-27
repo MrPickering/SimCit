@@ -139,10 +139,17 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
+  width: 100%;
+  gap: 4px;
 }
 
 #mobileInfoBar .info-item {
   text-align: center;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 #mobileInfoBar .info-label {
@@ -152,7 +159,29 @@
 
 #mobileInfoBar .info-value {
   font-weight: 600;
+  white-space: nowrap;
 }
+
+.info-demand-mobile .info-value {
+  display: flex;
+  gap: 3px;
+}
+
+.mobile-demand {
+  font-weight: 700;
+  font-size: 11px;
+  width: 16px;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  border-radius: 2px;
+}
+
+.mobile-demand-r { background-color: rgba(0, 200, 0, 0.3); color: #4caf50; }
+.mobile-demand-c { background-color: rgba(0, 100, 255, 0.3); color: #42a5f5; }
+.mobile-demand-i { background-color: rgba(255, 200, 0, 0.3); color: #ffca28; }
+.mobile-demand.demand-high { opacity: 1; }
+.mobile-demand.demand-low { opacity: 0.4; }
 
 /* ============================================
    Mobile Quick Actions
@@ -318,9 +347,12 @@
 
   /* Show mobile UI elements */
   #mobileToolbarToggle,
-  #mobileInfoBar,
   #mobileQuickActions {
     display: flex;
+  }
+
+  #mobileInfoBar {
+    display: block;
   }
 
   #mobileToolPalette {
@@ -465,6 +497,39 @@
     width: 50px;
     height: 50px;
   }
+}
+
+/* Mobile AI Performance Badge */
+.info-ai-perf-mobile {
+  display: none;
+}
+
+.info-ai-perf-mobile.ai-perf-visible {
+  display: block;
+}
+
+.info-ai-perf-mobile .info-value {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
+#mobileAiGrade {
+  display: inline-block;
+  font-weight: 700;
+  font-size: 11px;
+  width: 18px;
+  height: 18px;
+  line-height: 18px;
+  text-align: center;
+  border-radius: 3px;
+  background-color: #666;
+  color: #fff;
+}
+
+#mobileAiTrend {
+  font-size: 9px;
 }
 
 /* Touch warning removal for mobile */
