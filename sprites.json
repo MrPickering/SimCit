@@ -1,0 +1,241 @@
+{
+  "$schema": "https://pickbits.ai/schema/sprites-v1.json",
+  "version": 1,
+  "gameId": "simcit",
+  "kind": "catalog",
+  "genre": "city-builder",
+  "onMissing": "loud",
+  "variants": [
+    "default"
+  ],
+  "root": "sprites",
+  "_note": "Authored 2026-07-13 by standard/author-simcit.mjs FROM THE ENGINE. SimCit is micropolisJS (a GPL'd Micropolis/SimCity port). Most of its art is a TILESET baked into base64 data URIs and is not sheet art; what is fetchable on disk is sprites/ — the moving objects. The whole contract is one line, src/baseSprite.js:93: ['obj', this.type, '-', this.frame - 1].join('') — so the key is obj<type>-<frame-1> and `type` is a SPRITE_* constant. The SPRITE_* set is therefore the complete set of art the engine can reach. kind is `catalog`: per GENRE_MOVESETS, a city-builder has no character anim bar — the audit is state-variant completeness, not a moveset. These frames are headings/cells of an object.",
+  "_knownGap": {
+    "what": "4 sprite frames on disk for a type the engine DOES NOT HAVE. spriteConstants.ts defines 7 types (train, helicopter, airplane, ship, monster, tornado, explosion); there is no 8th. Nothing in the engine can compose the key \"obj8-*\", so this art is unreachable by construction. Do NOT fix this by declaring an 8th type the game cannot instantiate — either the engine gains the type, or the art is archived.",
+    "files": [
+      "obj8-0.png",
+      "obj8-1.png",
+      "obj8-2.png",
+      "obj8-3.png"
+    ]
+  },
+  "mechanics": {
+    "_note": "No actors. A city-builder animates objects and tiles, not characters."
+  },
+  "sheets": {
+    "train": {
+      "storage": "files",
+      "frames": 5,
+      "files": [
+        "obj1-0.png",
+        "obj1-1.png",
+        "obj1-2.png",
+        "obj1-3.png",
+        "obj1-4.png"
+      ]
+    },
+    "helicopter": {
+      "storage": "files",
+      "frames": 8,
+      "files": [
+        "obj2-0.png",
+        "obj2-1.png",
+        "obj2-2.png",
+        "obj2-3.png",
+        "obj2-4.png",
+        "obj2-5.png",
+        "obj2-6.png",
+        "obj2-7.png"
+      ]
+    },
+    "airplane": {
+      "storage": "files",
+      "frames": 11,
+      "files": [
+        "obj3-0.png",
+        "obj3-1.png",
+        "obj3-2.png",
+        "obj3-3.png",
+        "obj3-4.png",
+        "obj3-5.png",
+        "obj3-6.png",
+        "obj3-7.png",
+        "obj3-8.png",
+        "obj3-9.png",
+        "obj3-10.png"
+      ]
+    },
+    "ship": {
+      "storage": "files",
+      "frames": 8,
+      "files": [
+        "obj4-0.png",
+        "obj4-1.png",
+        "obj4-2.png",
+        "obj4-3.png",
+        "obj4-4.png",
+        "obj4-5.png",
+        "obj4-6.png",
+        "obj4-7.png"
+      ]
+    },
+    "monster": {
+      "storage": "files",
+      "frames": 16,
+      "files": [
+        "obj5-0.png",
+        "obj5-1.png",
+        "obj5-2.png",
+        "obj5-3.png",
+        "obj5-4.png",
+        "obj5-5.png",
+        "obj5-6.png",
+        "obj5-7.png",
+        "obj5-8.png",
+        "obj5-9.png",
+        "obj5-10.png",
+        "obj5-11.png",
+        "obj5-12.png",
+        "obj5-13.png",
+        "obj5-14.png",
+        "obj5-15.png"
+      ]
+    },
+    "tornado": {
+      "storage": "files",
+      "frames": 3,
+      "files": [
+        "obj6-0.png",
+        "obj6-1.png",
+        "obj6-2.png"
+      ]
+    },
+    "explosion": {
+      "storage": "files",
+      "frames": 6,
+      "files": [
+        "obj7-0.png",
+        "obj7-1.png",
+        "obj7-2.png",
+        "obj7-3.png",
+        "obj7-4.png",
+        "obj7-5.png"
+      ]
+    }
+  },
+  "anims": {
+    "train": {
+      "sheet": "train",
+      "frames": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    },
+    "helicopter": {
+      "sheet": "helicopter",
+      "frames": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    },
+    "airplane": {
+      "sheet": "airplane",
+      "frames": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    },
+    "ship": {
+      "sheet": "ship",
+      "frames": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    },
+    "monster": {
+      "sheet": "monster",
+      "frames": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    },
+    "tornado": {
+      "sheet": "tornado",
+      "frames": [
+        0,
+        1,
+        2
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    },
+    "explosion": {
+      "sheet": "explosion",
+      "frames": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    }
+  }
+}
