@@ -206,6 +206,12 @@ var play = function(e) {
 
   // Launch a new game
   var g = new Game(this.map, this.tileSet, this.snowTileSet, this.spriteSheet, difficulty, name);
+
+  // Expose the live Game so the PB drive surface can advance it. The splash creates the
+  // Game and drops the reference on the floor, so without this there is nothing for a
+  // harness to step — and check 6 could never run on this game.
+  // (asset-factory/standard/RUNTIME.md)
+  if (typeof window !== 'undefined') window.__simcitGame = g;
 };
 
 

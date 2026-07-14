@@ -8,11 +8,68 @@
   "variants": [
     "default"
   ],
-  "root": "sprites",
-  "_note": "Authored 2026-07-13 by standard/author-simcit.mjs FROM THE ENGINE. SimCit is micropolisJS (a GPL'd Micropolis/SimCity port). Most of its art is a TILESET baked into base64 data URIs and is not sheet art; what is fetchable on disk is sprites/ — the moving objects. The whole contract is one line, src/baseSprite.js:93: ['obj', this.type, '-', this.frame - 1].join('') — so the key is obj<type>-<frame-1> and `type` is a SPRITE_* constant. The SPRITE_* set is therefore the complete set of art the engine can reach. kind is `catalog`: per GENRE_MOVESETS, a city-builder has no character anim bar — the audit is state-variant completeness, not a moveset. These frames are headings/cells of an object.",
+  "root": ".",
+  "_note": "Authored 2026-07-13 by standard/author-simcit.mjs FROM THE ENGINE — from the code that actually DRAWS: gameCanvas.js:416 does drawImage(this._spriteSheet, (frame-1)*48, (type-1)*48), and the sheet is images/sprites.png (via <img id=\"sprites\">, micropolis.js:41). An earlier version of this script authored from baseSprite.js:92 getFileName(), which composes obj<type>-<frame> and matches the 61 PNGs in sprites/. That function is DEAD CODE — exported and called by nothing. Grep proves a symbol exists, not that it is reachable. RULE 0: micropolis.js:42 polls sprites.complete and starts once true. A 404 ALSO sets complete = true (naturalWidth 0), so a missing sheet neither stalls nor throws — every drawImage silently draws nothing and the city runs with no trains, no planes, no monster.",
   "_knownGap": {
-    "what": "4 sprite frames on disk for a type the engine DOES NOT HAVE. spriteConstants.ts defines 7 types (train, helicopter, airplane, ship, monster, tornado, explosion); there is no 8th. Nothing in the engine can compose the key \"obj8-*\", so this art is unreachable by construction. Do NOT fix this by declaring an 8th type the game cannot instantiate — either the engine gains the type, or the art is archived.",
+    "what": "61 PNGs in sprites/ that NOTHING loads. They are the per-frame form of the art that images/sprites.png packs, addressed by a getFileName() that no caller invokes. Unreachable by construction — archive them, or wire a loader that uses them. Do not declare them as live art: I did that once and it was wrong.",
     "files": [
+      "obj1-0.png",
+      "obj1-1.png",
+      "obj1-2.png",
+      "obj1-3.png",
+      "obj1-4.png",
+      "obj2-0.png",
+      "obj2-1.png",
+      "obj2-2.png",
+      "obj2-3.png",
+      "obj2-4.png",
+      "obj2-5.png",
+      "obj2-6.png",
+      "obj2-7.png",
+      "obj3-0.png",
+      "obj3-1.png",
+      "obj3-10.png",
+      "obj3-2.png",
+      "obj3-3.png",
+      "obj3-4.png",
+      "obj3-5.png",
+      "obj3-6.png",
+      "obj3-7.png",
+      "obj3-8.png",
+      "obj3-9.png",
+      "obj4-0.png",
+      "obj4-1.png",
+      "obj4-2.png",
+      "obj4-3.png",
+      "obj4-4.png",
+      "obj4-5.png",
+      "obj4-6.png",
+      "obj4-7.png",
+      "obj5-0.png",
+      "obj5-1.png",
+      "obj5-10.png",
+      "obj5-11.png",
+      "obj5-12.png",
+      "obj5-13.png",
+      "obj5-14.png",
+      "obj5-15.png",
+      "obj5-2.png",
+      "obj5-3.png",
+      "obj5-4.png",
+      "obj5-5.png",
+      "obj5-6.png",
+      "obj5-7.png",
+      "obj5-8.png",
+      "obj5-9.png",
+      "obj6-0.png",
+      "obj6-1.png",
+      "obj6-2.png",
+      "obj7-0.png",
+      "obj7-1.png",
+      "obj7-2.png",
+      "obj7-3.png",
+      "obj7-4.png",
+      "obj7-5.png",
       "obj8-0.png",
       "obj8-1.png",
       "obj8-2.png",
@@ -23,173 +80,31 @@
     "_note": "No actors. A city-builder animates objects and tiles, not characters."
   },
   "sheets": {
-    "train": {
-      "storage": "files",
-      "frames": 5,
-      "files": [
-        "obj1-0.png",
-        "obj1-1.png",
-        "obj1-2.png",
-        "obj1-3.png",
-        "obj1-4.png"
-      ]
+    "sprites": {
+      "storage": "grid",
+      "file": "images/sprites.png",
+      "cell": [
+        48,
+        48
+      ],
+      "cols": 16,
+      "rows": 8,
+      "frames": 128,
+      "note": "gameCanvas.js:416 indexes this as (frame-1)*48, (type-1)*48 — one row per SPRITE_* type"
     },
-    "helicopter": {
-      "storage": "files",
-      "frames": 8,
-      "files": [
-        "obj2-0.png",
-        "obj2-1.png",
-        "obj2-2.png",
-        "obj2-3.png",
-        "obj2-4.png",
-        "obj2-5.png",
-        "obj2-6.png",
-        "obj2-7.png"
-      ]
-    },
-    "airplane": {
-      "storage": "files",
-      "frames": 11,
-      "files": [
-        "obj3-0.png",
-        "obj3-1.png",
-        "obj3-2.png",
-        "obj3-3.png",
-        "obj3-4.png",
-        "obj3-5.png",
-        "obj3-6.png",
-        "obj3-7.png",
-        "obj3-8.png",
-        "obj3-9.png",
-        "obj3-10.png"
-      ]
-    },
-    "ship": {
-      "storage": "files",
-      "frames": 8,
-      "files": [
-        "obj4-0.png",
-        "obj4-1.png",
-        "obj4-2.png",
-        "obj4-3.png",
-        "obj4-4.png",
-        "obj4-5.png",
-        "obj4-6.png",
-        "obj4-7.png"
-      ]
-    },
-    "monster": {
-      "storage": "files",
-      "frames": 16,
-      "files": [
-        "obj5-0.png",
-        "obj5-1.png",
-        "obj5-2.png",
-        "obj5-3.png",
-        "obj5-4.png",
-        "obj5-5.png",
-        "obj5-6.png",
-        "obj5-7.png",
-        "obj5-8.png",
-        "obj5-9.png",
-        "obj5-10.png",
-        "obj5-11.png",
-        "obj5-12.png",
-        "obj5-13.png",
-        "obj5-14.png",
-        "obj5-15.png"
-      ]
-    },
-    "tornado": {
+    "tiles": {
       "storage": "files",
       "frames": 3,
       "files": [
-        "obj6-0.png",
-        "obj6-1.png",
-        "obj6-2.png"
-      ]
-    },
-    "explosion": {
-      "storage": "files",
-      "frames": 6,
-      "files": [
-        "obj7-0.png",
-        "obj7-1.png",
-        "obj7-2.png",
-        "obj7-3.png",
-        "obj7-4.png",
-        "obj7-5.png"
+        "images/tiles.png",
+        "images/tilessnow.png",
+        "images/dirtbg.png"
       ]
     }
   },
   "anims": {
     "train": {
-      "sheet": "train",
-      "frames": [
-        0,
-        1,
-        2,
-        3,
-        4
-      ],
-      "fps": 0,
-      "loop": false,
-      "tier": "REQUIRED"
-    },
-    "helicopter": {
-      "sheet": "helicopter",
-      "frames": [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7
-      ],
-      "fps": 0,
-      "loop": false,
-      "tier": "REQUIRED"
-    },
-    "airplane": {
-      "sheet": "airplane",
-      "frames": [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10
-      ],
-      "fps": 0,
-      "loop": false,
-      "tier": "REQUIRED"
-    },
-    "ship": {
-      "sheet": "ship",
-      "frames": [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7
-      ],
-      "fps": 0,
-      "loop": false,
-      "tier": "REQUIRED"
-    },
-    "monster": {
-      "sheet": "monster",
+      "sheet": "sprites",
       "frames": [
         0,
         1,
@@ -212,26 +127,145 @@
       "loop": false,
       "tier": "REQUIRED"
     },
-    "tornado": {
-      "sheet": "tornado",
+    "helicopter": {
+      "sheet": "sprites",
       "frames": [
-        0,
-        1,
-        2
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    },
+    "airplane": {
+      "sheet": "sprites",
+      "frames": [
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    },
+    "ship": {
+      "sheet": "sprites",
+      "frames": [
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    },
+    "monster": {
+      "sheet": "sprites",
+      "frames": [
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        76,
+        77,
+        78,
+        79
+      ],
+      "fps": 0,
+      "loop": false,
+      "tier": "REQUIRED"
+    },
+    "tornado": {
+      "sheet": "sprites",
+      "frames": [
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        88,
+        89,
+        90,
+        91,
+        92,
+        93,
+        94,
+        95
       ],
       "fps": 0,
       "loop": false,
       "tier": "REQUIRED"
     },
     "explosion": {
-      "sheet": "explosion",
+      "sheet": "sprites",
       "frames": [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5
+        96,
+        97,
+        98,
+        99,
+        100,
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+        107,
+        108,
+        109,
+        110,
+        111
       ],
       "fps": 0,
       "loop": false,

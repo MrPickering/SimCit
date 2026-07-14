@@ -11,6 +11,11 @@
  *
  */
 
+// PB runtime — the shared loud-failure channel + drive surface. Side-effect import:
+// it sets window.PB / window.__pbAssetErrors. MUST come first, so the tileset and
+// sprite loaders below can report through it. (asset-factory/standard/RUNTIME.md)
+import './pb-runtime.js';
+
 import $ from "jquery";
 
 import { Config } from './config.js';
@@ -39,9 +44,44 @@ var onTilesLoaded = function() {
 var onAllTilesLoaded = function() {
   // Kick things off properly
   var sprites = $('#sprites')[0];
+  // RULE 0 (asset-factory/standard/RUNTIME.md). `complete` is TRUE for a 404 as well as
+  // a success — the browser is done either way. So a missing sheet neither stalls this
+  // poll nor throws: every drawImage below silently draws nothing, and the city runs
+  // with no trains, no planes and no monster. Invisible, not broken. naturalWidth is the
+  // only thing that tells them apart.
+  if (sprites.complete && !sprites.naturalWidth && typeof PB !== 'undefined') {
+    PB.missing('sheet', 'images/sprites.png', 'loaded 0x0 — every moving sprite will draw nothing');
+  }
   if (sprites.complete) {
     $('#loadingBanner').css('display', 'none');
     var s = new SplashScreen(tileSet, snowTileSet, sprites);
+
+    // PB drive surface (asset-factory/standard/RUNTIME.md).
+    //
+    // SimCit boots into a SPLASH SCREEN that generates a map and waits for the player to
+    // accept it — the simulation is not running and nothing is drawn until then. So
+    // `boot` has to get past the splash, or the harness would drive a menu and R5 would
+    // assert silence over a screen with no city on it.
+    if (typeof PB !== 'undefined') {
+      PB.drive({
+        boot: function() {
+          // SimCit boots into a SPLASH: it generates a map and waits for the player to
+          // submit the name/difficulty form. Nothing simulates and nothing is drawn until
+          // then. So drive the REAL path — submit the form — rather than reaching past it.
+          // Otherwise the harness would drive a menu and R5 would assert silence over a
+          // screen with no city on it.
+          $('#playForm').trigger('submit');
+        },
+        step: function(n) {
+          var g = window.__simcitGame;
+          for (var i = 0; i < (n || 1); i++) { if (g && g.tick) g.tick(); }
+        },
+        draw: function() {
+          var g = window.__simcitGame;
+          if (g && g.animate) g.animate();
+        },
+      });
+    }
   } else {
      window.setTimeout(onAllTilesLoaded, 0);
   }
