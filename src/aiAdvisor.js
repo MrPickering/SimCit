@@ -57,6 +57,10 @@ var MIN_RESERVE = 500;
 var COMFORTABLE_FUNDS = 2000;
 var GRID_SPACING = 4;
 var DISTRICT_RADIUS = 6;
+// Mirrors traffic.js's own MAX_TRAFFIC_DISTANCE: the engine's traffic routing gives
+// up searching for a job/destination beyond this many tiles, so a residential zone
+// further than this from any job zone can never actually grow.
+var MAX_TRAFFIC_DISTANCE = 30;
 
 // Power math constants
 var COAL_CAPACITY = 700;
@@ -243,21 +247,21 @@ AIAdvisor.prototype.getAdvice = function() {
 };
 
 
-AIAdvisor.prototype.decideBestAction = function() {
-  var recs = this.analyze();
-  if (recs.length === 0) return null;
-  for (var i = 0; i < recs.length; i++) {
-    if (recs[i].action) return recs[i];
-  }
-  return null;
-};
-
-
 // ---- Budget actions (FREE) ----
 
 AIAdvisor.prototype._analyzeBudgetActions = function(budget, census) {
   var recs = [];
 
+  // NOTE: tried escalating tax rate up to 18% in response to sustained negative
+  // cashFlow (on the theory that a structural deficit needs more revenue, not just
+  // waiting it out at the 9% low-funds tier). Verified in testing this is actively
+  // harmful and reverted: SimCity's RCI demand valves are very sensitive to tax rate,
+  // so pushing tax that high suppresses growth hard enough to crash population
+  // (dropped a CITY-class city back to TOWN class, oscillating with permanent
+  // negative cashflow for the rest of a 500-year run) — the tax hike caused the very
+  // revenue collapse it was meant to fix. A commercial-oversupply/negative-cashflow
+  // situation needs to be fixed on the spending or zoning side, not by taxing the
+  // remaining tax base into leaving.
   var optimalTax = 7;
   if (budget.totalFunds < 1000 && census.totalPop > 0) {
     optimalTax = 9;
@@ -492,16 +496,43 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   }
 
   // PRIORITY 3: Employment balanced - follow valve demand with ratio awareness
+  //
+  // The valve thresholds here used to require > 100 before building anything, which
+  // sounds like a reasonable "wait for real demand" guard but in practice caused
+  // growth to freeze solid for hundreds of simulated years: confirmed in testing that
+  // the simulation's own RCI valves settle into an equilibrium well under 100 for
+  // long stretches even with abundant unused funds (tens of thousands of dollars
+  // sitting idle) and plenty of open, buildable land — the valve model just doesn't
+  // reliably spike above 100 once a city reaches a certain size and tax rate. Any
+  // positive valve at all (still gated by the employment-ratio checks above and the
+  // reserve/power checks below, so this can't overspend or outrun infrastructure) is
+  // a genuine, if modest, demand signal worth acting on rather than sitting idle.
   var buildChoices = [];
 
-  if (valves.resValve > 100) {
+  if (valves.resValve > 0) {
     buildChoices.push({ tool: 'residential', priority: valves.resValve / 100 });
   }
-  if (valves.comValve > 100) {
+  if (valves.comValve > 0) {
     buildChoices.push({ tool: 'commercial', priority: valves.comValve / 75 });
   }
-  if (valves.indValve > 100) {
+  if (valves.indValve > 0) {
     buildChoices.push({ tool: 'industrial', priority: valves.indValve / 75 });
+  }
+
+  // Surplus-funds fallback: if no valve is even modestly positive but cash is piling
+  // up well beyond the reserve (nothing productive to spend it on), that's the city
+  // sitting idle rather than growing — pick whichever zone type is least oversupplied
+  // and try it anyway. An idle treasury is worse than a slightly-early zone.
+  if (buildChoices.length === 0 && budget.totalFunds > buildReserve * 5) {
+    var candidates = [
+      { tool: 'residential', valve: valves.resValve },
+      { tool: 'commercial', valve: valves.comValve },
+      { tool: 'industrial', valve: valves.indValve }
+    ];
+    candidates.sort(function(a, b) { return b.valve - a.valve; });
+    if (candidates[0].valve > -500) {
+      buildChoices.push({ tool: candidates[0].tool, priority: 0.5 });
+    }
   }
 
   buildChoices.sort(function(a, b) { return b.priority - a.priority; });
@@ -754,64 +785,114 @@ AIAdvisor.prototype.findBestZoneLocation = function(toolName) {
 };
 
 
-// Find road positions needed to expand the grid for a zone type
+// Find road positions to extend the network into open territory, creating fresh
+// buildable frontier once the easily-reachable area near the existing grid fills up.
+// The old version only ever tried two fixed offsets relative to the original starter
+// grid's exact origin, so it stopped working the moment those two specific slots were
+// taken or blocked by terrain — in practice it succeeded well under 1% of the time and
+// zone building would permanently stall once the initial grid was full. This instead
+// scans the whole map for ANY existing road tile with a run of open ground extending
+// outward from it in a cardinal direction, so it keeps working regardless of terrain
+// or however organically the city has actually grown. It still prefers extending on
+// the district-correct side of the main road (north for residential, south for
+// industrial) when a grid orientation is known, but that's a scoring preference, not
+// a hard requirement, so it degrades gracefully instead of failing outright.
 AIAdvisor.prototype.findGridExpansionRoads = function(zoneType) {
-  if (!this._plan.initialized) return null;
-
-  var gx = this._plan.gridOriginX;
-  var gy = this._plan.gridOriginY;
   var map = this.map;
-  var path = [];
+  var width = map.width;
+  var height = map.height;
+  var gy = this._plan.initialized ? this._plan.gridOriginY : null;
+  var dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  var STUB_LENGTH = 6;
+  var CROSS_LENGTH = 6;
 
-  if (zoneType === 'residential') {
-    // Extend main road east or west, then add a parallel road north
-    // Try extending east first
-    var extendX = gx + 8;
-    while (extendX < map.width - 5 && TileUtils.isRoad(map.getTileValue(extendX, gy))) {
-      extendX += 4;
-    }
-    if (extendX < map.width - 5 && this._isAreaClear(extendX, gy, 4, 1)) {
-      // Extend main road east by 4 tiles
-      for (var rx = extendX; rx < extendX + 4 && rx < map.width; rx++) {
-        path.push({ x: rx, y: gy });
-      }
-      // Add parallel road north at gy-4 for new zone slots
-      for (var rx = extendX; rx < extendX + 4 && rx < map.width; rx++) {
-        if (gy - 4 >= 0) path.push({ x: rx, y: gy - 4 });
-      }
-      return path;
-    }
+  var isBuildable = function(x, y) {
+    if (x < 2 || y < 2 || x >= width - 2 || y >= height - 2) return false;
+    var tv = map.getTileValue(x, y);
+    return tv === TileValues.DIRT || TileUtils.canBulldoze(tv);
+  };
 
-    // Try extending west
-    extendX = gx - 8;
-    while (extendX >= 2 && TileUtils.isRoad(map.getTileValue(extendX, gy))) {
-      extendX -= 4;
+  var extendLine = function(fromX, fromY, dx, dy, length) {
+    var line = [];
+    for (var step = 1; step <= length; step++) {
+      var nx = fromX + dx * step;
+      var ny = fromY + dy * step;
+      if (!isBuildable(nx, ny)) break;
+      line.push({ x: nx, y: ny });
     }
-    if (extendX >= 2 && this._isAreaClear(extendX - 3, gy, 4, 1)) {
-      for (var rx = extendX; rx > extendX - 4 && rx >= 0; rx--) {
-        path.push({ x: rx, y: gy });
+    return line;
+  };
+
+  var best = null;
+  var bestScore = -Infinity;
+
+  for (var y = 2; y < height - 2; y++) {
+    for (var x = 2; x < width - 2; x++) {
+      if (!TileUtils.isRoad(map.getTileValue(x, y))) continue;
+
+      for (var d = 0; d < dirs.length; d++) {
+        var dx = dirs[d][0];
+        var dy = dirs[d][1];
+        var stub = extendLine(x, y, dx, dy, STUB_LENGTH);
+        if (stub.length < 4) continue;
+
+        // Don't push the residential frontier out past commuting range: findBestZoneLocation
+        // hard-rejects any residential candidate beyond MAX_TRAFFIC_DISTANCE from a job
+        // zone, so a stub built further out than that is land nothing can ever actually
+        // be placed on — confirmed in testing to create a permanent deadlock where
+        // expansion keeps "succeeding" by building road into the distance while zone
+        // placement keeps failing on that same land forever, each reinforcing the other.
+        if (zoneType === 'residential') {
+          var endPos = stub[stub.length - 1];
+          var hasJobsAlready = this.simulation._census.comZonePop > 0 || this.simulation._census.indZonePop > 0;
+          if (hasJobsAlready &&
+              !this._hasNearbyCommercial(endPos.x, endPos.y, MAX_TRAFFIC_DISTANCE) &&
+              !this._hasNearbyIndustrial(endPos.x, endPos.y, MAX_TRAFFIC_DISTANCE)) {
+            continue;
+          }
+        }
+
+        var score = 0;
+        var endY = stub[stub.length - 1].y;
+        if (gy !== null) {
+          if (zoneType === 'residential' && endY <= gy) score += 100;
+          if (zoneType === 'industrial' && endY > gy) score += 100;
+        }
+        // Prefer extensions further from the built-up centre, not closer to it.
+        // Preferring compactness here sounds reasonable but backfires badly: nearly
+        // every road tile deep inside an already-developed area has SOME direction
+        // with a few clear tiles (a gap between existing structures), so "closest to
+        // centre" kept picking those over genuine frontier tiles at the city's edge —
+        // repeatedly re-stubbing small gaps near the middle instead of pushing the
+        // boundary outward. Confirmed in testing: zone building would freeze solid
+        // for 100+ simulated years with over half the map's tiles still open dirt,
+        // because the thin road network had already spread (via these central
+        // micro-stubs) into nearly every remaining pocket without ever reaching the
+        // wide open land further out, leaving no 3x3 gap anywhere big enough for a
+        // zone. Rewarding distance from centre instead pushes new roads toward the
+        // genuine, unclaimed frontier where there's actual room to build.
+        score += Math.abs(x - map.cityCentreX) + Math.abs(y - map.cityCentreY);
+
+        if (score > bestScore) {
+          bestScore = score;
+          // A single one-tile-wide stub only ever exposes one new road-adjacent edge
+          // — barely enough for a single zone slot before the frontier is used up
+          // again. Cap the far end with a perpendicular cross-road in both
+          // directions so one successful expansion opens up a proper block (3 new
+          // road edges instead of 1), roughly matching what the original starter
+          // grid gave the AI for free — this is what actually keeps zone-building
+          // supplied with fresh slots instead of stalling out once the easily
+          // reachable land near the existing roads is used up.
+          var end = stub[stub.length - 1];
+          var perp1 = extendLine(end.x, end.y, dy, dx, CROSS_LENGTH);
+          var perp2 = extendLine(end.x, end.y, -dy, -dx, CROSS_LENGTH);
+          best = stub.concat(perp1, perp2);
+        }
       }
-      return path;
-    }
-  } else if (zoneType === 'industrial') {
-    // Extend branch road further south or add parallel branches
-    var extendY = gy + 12;
-    while (extendY < map.height - 5 && TileUtils.isRoad(map.getTileValue(gx, extendY))) {
-      extendY += 4;
-    }
-    if (extendY < map.height - 5) {
-      for (var ry = extendY; ry < extendY + 4 && ry < map.height; ry++) {
-        path.push({ x: gx, y: ry });
-      }
-      // Add cross-road at the new depth
-      for (var rx = gx - 2; rx <= gx + 4; rx++) {
-        if (rx !== gx) path.push({ x: rx, y: extendY });
-      }
-      return path;
     }
   }
 
-  return null;
+  return best;
 };
 
 
@@ -861,64 +942,80 @@ AIAdvisor.prototype.findBestAirportLocation = function() {
 };
 
 
-AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
-  var path = [];
-  var cx = fromX;
-  var cy = fromY;
+// Generic breadth-first search over the tile grid. `canTraverse(tv, tile)` gates
+// which tiles the search is allowed to step through; `isGoal(x, y, tv, tile)` decides
+// when we've arrived (checked on every neighbor, even ones canTraverse rejects, so a
+// goal tile that fails canTraverse — e.g. an existing road when we're routing wire
+// through dirt/road tiles only — still terminates the search). Unlike the old greedy
+// steppers (move toward target, give up on the first double-blocked tile), this finds
+// an actual shortest path or correctly reports "unreachable" — needed because real
+// city layouts are full of dead ends a straight-line walk can't route around.
+// Returns an array of {x, y} steps from just after the start through the goal
+// (exclusive of the start tile itself), or null if no goal was reached within
+// maxNodes expansions.
+AIAdvisor.prototype._bfsPath = function(startX, startY, canTraverse, isGoal, maxNodes) {
+  // Default to full map coverage: a sprawling city can easily have a genuinely
+  // reachable connection point 60+ tiles away, and an artificially low cap makes a
+  // solvable case look "unreachable". Dictionary-based BFS over even the largest map
+  // size here (240x200 = 48000 tiles) is still cheap — this only runs when the AI is
+  // actually trying to fix a specific disconnected zone, not on every tick.
+  maxNodes = maxNodes || (this.map.width * this.map.height);
   var map = this.map;
-  var maxSteps = Math.abs(toX - fromX) + Math.abs(toY - fromY) + 5;
+  var visited = {};
+  visited[startX + ',' + startY] = true;
+  var queue = [{ x: startX, y: startY, prev: null }];
+  var dirs = [[0, -1], [1, 0], [0, 1], [-1, 0]];
 
-  for (var step = 0; step < maxSteps; step++) {
-    if (cx === toX && cy === toY) break;
+  for (var head = 0; head < queue.length && head < maxNodes; head++) {
+    var node = queue[head];
 
-    var dx = toX - cx;
-    var dy = toY - cy;
-    var nx, ny;
+    for (var d = 0; d < dirs.length; d++) {
+      var nx = node.x + dirs[d][0];
+      var ny = node.y + dirs[d][1];
+      if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
 
-    if (Math.abs(dx) >= Math.abs(dy)) {
-      nx = cx + (dx > 0 ? 1 : -1);
-      ny = cy;
-    } else {
-      nx = cx;
-      ny = cy + (dy > 0 ? 1 : -1);
-    }
+      var key = nx + ',' + ny;
+      if (visited[key]) continue;
+      visited[key] = true;
 
-    if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
-      var tv = map.getTileValue(nx, ny);
-      if (tv === TileValues.DIRT || TileUtils.canBulldoze(tv) || TileUtils.isRoad(tv)) {
-        if (!TileUtils.isRoad(tv)) {
-          path.push({ x: nx, y: ny });
+      var ntv = map.getTileValue(nx, ny);
+      var ntile = map.getTile(nx, ny);
+      var next = { x: nx, y: ny, prev: node };
+
+      if (isGoal(nx, ny, ntv, ntile)) {
+        var path = [];
+        for (var cur = next; cur; cur = cur.prev) {
+          if (cur.x === startX && cur.y === startY) break;
+          path.unshift({ x: cur.x, y: cur.y });
         }
-        cx = nx;
-        cy = ny;
-        continue;
+        return path;
       }
-    }
 
-    if (Math.abs(dx) >= Math.abs(dy)) {
-      nx = cx;
-      ny = cy + (dy !== 0 ? (dy > 0 ? 1 : -1) : 1);
-    } else {
-      nx = cx + (dx !== 0 ? (dx > 0 ? 1 : -1) : 1);
-      ny = cy;
+      if (canTraverse(ntv, ntile)) queue.push(next);
     }
-
-    if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
-      var tv = map.getTileValue(nx, ny);
-      if (tv === TileValues.DIRT || TileUtils.canBulldoze(tv) || TileUtils.isRoad(tv)) {
-        if (!TileUtils.isRoad(tv)) {
-          path.push({ x: nx, y: ny });
-        }
-        cx = nx;
-        cy = ny;
-        continue;
-      }
-    }
-
-    break;
   }
 
-  return path;
+  return null;
+};
+
+
+var isOpenOrRoad = function(tv) {
+  return tv === TileValues.DIRT || TileUtils.canBulldoze(tv) || TileUtils.isRoad(tv);
+};
+
+
+AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
+  var map = this.map;
+  var isGoal = function(x, y, tv) {
+    return (x === toX && y === toY) || TileUtils.isRoad(tv);
+  };
+  var path = this._bfsPath(fromX, fromY, function(tv) { return isOpenOrRoad(tv); }, isGoal);
+  if (!path) return [];
+  // Only the tiles that actually need a road laid — drop any pre-existing road
+  // (typically the goal itself, when we routed toward an existing junction).
+  return path.filter(function(pos) {
+    return !TileUtils.isRoad(map.getTileValue(pos.x, pos.y));
+  });
 };
 
 
@@ -933,23 +1030,10 @@ AIAdvisor.prototype.findRoadToConnect = function() {
       if (!tile.isZone()) continue;
       if (this._hasAdjacentRoad(x, y)) continue;
 
-      var roadTarget = this._findNearestRoad(x, y);
-      if (roadTarget) {
-        var path = this.findRoadPath(x, y, roadTarget.x, roadTarget.y);
-        if (path.length > 0) return path;
-      }
-
-      var dirs = [[0, -2], [2, 0], [0, 2], [-2, 0]];
-      for (var d = 0; d < dirs.length; d++) {
-        var rx = x + dirs[d][0];
-        var ry = y + dirs[d][1];
-        if (rx >= 0 && ry >= 0 && rx < width && ry < height) {
-          var tv = map.getTileValue(rx, ry);
-          if (tv === TileValues.DIRT || TileUtils.canBulldoze(tv)) {
-            return [{ x: rx, y: ry }];
-          }
-        }
-      }
+      var path = this._bfsPath(x, y,
+        function(tv) { return isOpenOrRoad(tv); },
+        function(nx, ny, tv) { return TileUtils.isRoad(tv); });
+      if (path && path.length > 0) return path;
     }
   }
 
@@ -957,7 +1041,10 @@ AIAdvisor.prototype.findRoadToConnect = function() {
 };
 
 
-// Find wire path to connect unpowered zones - routes along roads
+// Find wire path to connect unpowered zones. The goal is "any tile that is actually
+// powered" (not merely conductive) — a conductive tile can belong to a dead wire
+// island that never made it back to a plant, and routing to one of those would just
+// extend the same disconnected island instead of fixing anything.
 AIAdvisor.prototype.findWireToConnect = function() {
   var map = this.map;
   var width = map.width;
@@ -969,17 +1056,8 @@ AIAdvisor.prototype.findWireToConnect = function() {
       if (!tile.isZone()) continue;
       if (tile.isPowered()) continue;
 
-      // Find nearest powered tile (prefer powered roads for wire routing)
-      var powerSource = this._findNearestPowered(x, y);
-      if (!powerSource) continue;
-
-      // Build wire path, preferring to follow roads
-      var path = this._findWirePath(x, y, powerSource.x, powerSource.y);
-      if (path.length > 0) return path;
-
-      // Fallback: direct path
-      var directPath = this.findRoadPath(x, y, powerSource.x, powerSource.y);
-      if (directPath.length > 0) return directPath;
+      var path = this._findWirePath(x, y);
+      if (path && path.length > 0) return path;
     }
   }
 
@@ -987,60 +1065,24 @@ AIAdvisor.prototype.findWireToConnect = function() {
 };
 
 
-// Wire path that follows roads (converts to road+wire hybrids)
-AIAdvisor.prototype._findWirePath = function(fromX, fromY, toX, toY) {
-  var path = [];
-  var cx = fromX;
-  var cy = fromY;
+// BFS to the nearest tile that is actually powered, over dirt/road/conductive tiles
+// (routing back through existing — even dead — wire is fine; it just means that
+// segment needs no new wire, filtered out below). Returns only the tiles that still
+// need wire laid, or [] if the nearest powered tile needs no new wire at all (already
+// fully conductive right up to it), or null if unreachable.
+AIAdvisor.prototype._findWirePath = function(fromX, fromY) {
   var map = this.map;
-  var maxSteps = Math.abs(toX - fromX) + Math.abs(toY - fromY) + 10;
-
-  for (var step = 0; step < maxSteps; step++) {
-    if (cx === toX && cy === toY) break;
-
-    var dx = toX - cx;
-    var dy = toY - cy;
-
-    // Try all 4 directions, prioritizing: toward target + road tiles
-    var candidates = [];
-    var dirs = [[0, -1], [1, 0], [0, 1], [-1, 0]];
-    for (var i = 0; i < dirs.length; i++) {
-      var nx = cx + dirs[i][0];
-      var ny = cy + dirs[i][1];
-      if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
-
-      var tv = map.getTileValue(nx, ny);
-      var tile = map.getTile(nx, ny);
-      var isRoad = TileUtils.isRoad(tv);
-      var isClear = tv === TileValues.DIRT || TileUtils.canBulldoze(tv);
-      var isConductive = tile.isConductive();
-
-      if (!isRoad && !isClear && !isConductive) continue;
-
-      // Score: prefer roads, prefer direction toward target
-      var score = 0;
-      if (isRoad) score += 100; // Strongly prefer wiring roads
-      if (isConductive) score += 50; // Already powered path
-      score -= Math.abs(nx - toX) + Math.abs(ny - toY); // Closer to target
-
-      candidates.push({ x: nx, y: ny, score: score, isRoad: isRoad, needsWire: isRoad && !isConductive });
-    }
-
-    if (candidates.length === 0) break;
-
-    candidates.sort(function(a, b) { return b.score - a.score; });
-    var best = candidates[0];
-
-    // Only add to path if it needs a wire placed
-    if (best.needsWire || (!TileUtils.isRoad(map.getTileValue(best.x, best.y)) && !map.getTile(best.x, best.y).isConductive())) {
-      path.push({ x: best.x, y: best.y });
-    }
-
-    cx = best.x;
-    cy = best.y;
-  }
-
-  return path;
+  var canTraverse = function(tv, tile) {
+    return isOpenOrRoad(tv) || tile.isConductive();
+  };
+  var isGoal = function(x, y, tv, tile) {
+    return tile.isPowered();
+  };
+  var path = this._bfsPath(fromX, fromY, canTraverse, isGoal);
+  if (!path) return null;
+  return path.filter(function(pos) {
+    return !map.getTile(pos.x, pos.y).isConductive();
+  });
 };
 
 
@@ -1116,15 +1158,17 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
   var traffic = this._safeBlockGet(blockMaps.trafficDensityMap, x, y);
   var popDensity = this._safeBlockGet(blockMaps.populationDensityMap, x, y);
 
-  // HARD POSITIONAL DISTRICT RULES (based on grid origin)
-  // Residential: NORTH of main road only (y <= gridOriginY)
-  // Industrial: SOUTH of main road only (y > gridOriginY)
-  // This prevents mixing regardless of build order
-  if (this._plan.initialized) {
-    var gridY = this._plan.gridOriginY;
-    if (toolName === 'residential' && y > gridY) return -9999;
-    if (toolName === 'industrial' && y <= gridY) return -9999;
-  }
+  // Local separation (the per-tool DISTRICT_RADIUS hard-reject below, plus the
+  // residential job-distance hard-reject above) is what keeps industrial pollution
+  // away from housing — not a single global north/south line through the original
+  // starter grid's position. That absolute rule used to hard-reject any residential
+  // zone south of the starter grid's exact Y coordinate (and any industrial zone
+  // north of it) regardless of how far away or how the city had actually grown,
+  // which caps total city size at whatever fits in one fixed-width band through the
+  // starter location — confirmed in testing: growth consistently plateaued in the
+  // low hundreds of zones on maps with room for a thousand-plus, because the AI
+  // could never start a second residential/industrial cluster anywhere else on the
+  // map. Local radius checks scale with the city instead of a single starting point.
 
   switch (toolName) {
     case 'residential':
@@ -1132,6 +1176,19 @@ AIAdvisor.prototype._scoreZoneLocation = function(x, y, toolName) {
       if (pollution > 100) return -9999;
       // HARD REJECT: industrial within district radius
       if (this._hasNearbyIndustrial(x, y, DISTRICT_RADIUS)) return -9999;
+      // HARD REJECT: no jobs within the engine's own traffic routing radius
+      // (MAX_TRAFFIC_DISTANCE in traffic.js) means commuters can never actually reach
+      // work from here, so the zone will sit at minimum population forever no matter
+      // how good it otherwise scores. Exempt while the city has no jobs anywhere yet,
+      // so the very first residential zones aren't stuck waiting on a chicken-and-egg
+      // industrial zone that itself wants residential nearby. This is what keeps a
+      // sprawling city's outskirts from filling up with permanently-stunted housing
+      // that only ever reaches the base tile stage.
+      var hasAnyJobsYet = this.simulation._census.comZonePop > 0 || this.simulation._census.indZonePop > 0;
+      if (hasAnyJobsYet && !this._hasNearbyCommercial(x, y, MAX_TRAFFIC_DISTANCE) &&
+          !this._hasNearbyIndustrial(x, y, MAX_TRAFFIC_DISTANCE)) {
+        return -9999;
+      }
       score += landValue * 2;
       score -= pollution * 4;
       score -= crime * 2;
@@ -1246,9 +1303,16 @@ AIAdvisor.prototype._isAreaClear = function(startX, startY, width, height) {
 
   for (var dy = 0; dy < height; dy++) {
     for (var dx = 0; dx < width; dx++) {
-      var tileValue = map.getTileValue(startX + dx, startY + dy);
+      var x = startX + dx;
+      var y = startY + dy;
+      var tileValue = map.getTileValue(x, y);
       if (tileValue !== TileValues.DIRT && !TileUtils.canBulldoze(tileValue))
         return false;
+      // canBulldoze() is true for standalone wire tiles (LHPOWER..LVPOWER10 — wire
+      // laid over bare dirt rather than on a road), so without this check the AI
+      // would happily pave a brand new zone right over a wire segment another zone
+      // depends on for power, severing it. Never treat conductive ground as "clear".
+      if (map.getTile(x, y).isConductive()) return false;
     }
   }
   return true;
@@ -1284,6 +1348,10 @@ AIAdvisor.prototype._hasNearbyRoad = function(x, y, radius) {
 };
 
 
+// Deliberately checks isPowered(), not isConductive(): a conductive tile can belong
+// to a wire island that never made it back to any plant (a stub built alongside a
+// prior zone but never stitched into the main grid). Scoring on conductivity alone
+// rewards leapfrogging next to those dead stubs, which only grows the fragmentation.
 AIAdvisor.prototype._hasNearbyPower = function(x, y, radius) {
   var map = this.map;
   for (var dy = -radius; dy <= radius; dy++) {
@@ -1291,8 +1359,7 @@ AIAdvisor.prototype._hasNearbyPower = function(x, y, radius) {
       var nx = x + dx;
       var ny = y + dy;
       if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
-        var tile = map.getTile(nx, ny);
-        if (tile.isPowered() || tile.isConductive()) return true;
+        if (map.getTile(nx, ny).isPowered()) return true;
       }
     }
   }
@@ -1373,44 +1440,6 @@ AIAdvisor.prototype._hasNearbyBuilding = function(x, y, centerTile, radius) {
     }
   }
   return false;
-};
-
-
-AIAdvisor.prototype._findNearestRoad = function(x, y) {
-  var map = this.map;
-  for (var radius = 1; radius < 25; radius++) {
-    for (var dy = -radius; dy <= radius; dy++) {
-      for (var dx = -radius; dx <= radius; dx++) {
-        if (Math.abs(dx) !== radius && Math.abs(dy) !== radius) continue;
-        var nx = x + dx;
-        var ny = y + dy;
-        if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
-          if (TileUtils.isRoad(map.getTileValue(nx, ny)))
-            return { x: nx, y: ny };
-        }
-      }
-    }
-  }
-  return null;
-};
-
-
-AIAdvisor.prototype._findNearestPowered = function(x, y) {
-  var map = this.map;
-  for (var radius = 1; radius < 30; radius++) {
-    for (var dy = -radius; dy <= radius; dy++) {
-      for (var dx = -radius; dx <= radius; dx++) {
-        if (Math.abs(dx) !== radius && Math.abs(dy) !== radius) continue;
-        var nx = x + dx;
-        var ny = y + dy;
-        if (nx >= 0 && ny >= 0 && nx < map.width && ny < map.height) {
-          var tile = map.getTile(nx, ny);
-          if (tile.isPowered()) return { x: nx, y: ny };
-        }
-      }
-    }
-  }
-  return null;
 };
 
 

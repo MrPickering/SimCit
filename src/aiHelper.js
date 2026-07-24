@@ -202,66 +202,75 @@ AIHelper.prototype._makeBar = function(value) {
 };
 
 
+// Try recommendations in priority order, falling through to the next one whenever
+// an action fails to execute. A single flaky/inapplicable recommendation (e.g. a
+// road-density heuristic that has nothing left to connect) would otherwise win the
+// priority sort every tick and permanently starve out lower-priority but genuinely
+// actionable work (like wiring up already-disconnected zones).
 AIHelper.prototype._executeNextAction = function() {
-  var action = this.advisor.decideBestAction();
-  if (!action) {
-    this._tryPlacePark();
-    return;
+  var recs = this.advisor.analyze();
+
+  for (var i = 0; i < recs.length; i++) {
+    var action = recs[i].action;
+    if (!action) continue;
+
+    var success = false;
+    var description = '';
+
+    switch (action.type) {
+      case 'build_starter':
+        success = this._buildStarterCity();
+        description = 'Building optimal starter city';
+        break;
+
+      case 'build':
+        success = this._buildZone(action.tool);
+        description = 'Building ' + action.tool;
+        break;
+
+      case 'build_roads':
+        success = this._buildRoadConnection();
+        description = 'Building road connection';
+        break;
+
+      case 'wire_connect':
+        success = this._buildWireConnection();
+        description = 'Connecting power lines';
+        break;
+
+      case 'set_tax':
+        success = this._setTaxRate(action.value);
+        description = 'Set tax to ' + action.value + '%';
+        break;
+
+      case 'set_funding':
+        success = this._setFunding(action.road, action.fire, action.police);
+        description = 'Adjusted service funding';
+        break;
+
+      case 'bulldoze_rubble':
+        success = this._bulldozeRubble();
+        description = 'Clearing disaster rubble';
+        break;
+
+      case 'expand_grid':
+        success = this._expandGrid(action.zoneType);
+        description = 'Expanding grid for ' + action.zoneType;
+        break;
+
+      default:
+        break;
+    }
+
+    if (success) {
+      this._actionCount++;
+      this._lastAction = description;
+      $('#aiStatus').text('#' + this._actionCount + ': ' + description);
+      return;
+    }
   }
 
-  var success = false;
-  var description = '';
-
-  switch (action.action.type) {
-    case 'build_starter':
-      success = this._buildStarterCity();
-      description = 'Building optimal starter city';
-      break;
-
-    case 'build':
-      success = this._buildZone(action.action.tool);
-      description = 'Building ' + action.action.tool;
-      break;
-
-    case 'build_roads':
-      success = this._buildRoadConnection();
-      description = 'Building road connection';
-      break;
-
-    case 'wire_connect':
-      success = this._buildWireConnection();
-      description = 'Connecting power lines';
-      break;
-
-    case 'set_tax':
-      success = this._setTaxRate(action.action.value);
-      description = 'Set tax to ' + action.action.value + '%';
-      break;
-
-    case 'set_funding':
-      success = this._setFunding(action.action.road, action.action.fire, action.action.police);
-      description = 'Adjusted service funding';
-      break;
-
-    case 'bulldoze_rubble':
-      success = this._bulldozeRubble();
-      description = 'Clearing disaster rubble';
-      break;
-
-    case 'expand_grid':
-      success = this._expandGrid(action.action.zoneType);
-      description = 'Expanding grid for ' + action.action.zoneType;
-      break;
-
-    default:
-      break;
-  }
-
-  if (success) {
-    this._actionCount++;
-    this._lastAction = description;
-    $('#aiStatus').text('#' + this._actionCount + ': ' + description);
-  }
+  this._tryPlacePark();
 };
 
 
@@ -289,11 +298,14 @@ AIHelper.prototype._buildRoadWithWire = function(x, y) {
   var budget = this.simulation.budget;
   if (budget.totalFunds < 15) return false; // $10 road + $5 wire
 
+  var builtSomething = false;
+
   var roadTool = this.tools.road;
   roadTool.doTool(x, y, this.blockMaps);
   if (roadTool.result === roadTool.TOOLRESULT_OK) {
     roadTool.modifyIfEnoughFunding(budget);
     if (roadTool.result === roadTool.TOOLRESULT_NO_MONEY) return false;
+    builtSomething = true;
   } else {
     roadTool.clear();
     // Road might already exist - still wire it
@@ -304,11 +316,20 @@ AIHelper.prototype._buildRoadWithWire = function(x, y) {
   wireTool.doTool(x, y, this.blockMaps);
   if (wireTool.result === wireTool.TOOLRESULT_OK) {
     wireTool.modifyIfEnoughFunding(budget);
+    builtSomething = true;
   } else {
     wireTool.clear();
   }
 
-  return true;
+  // Report honest success: if neither tool placed anything new, this call did
+  // nothing (the tile is genuinely unbuildable here — water without a bridge, map
+  // edge, etc.) unless it's already a fully-formed road+wire hybrid, which just means
+  // there was nothing left to do. Silently reporting success on a real failure was
+  // letting a single unbuildable frontier tile masquerade as endless "progress" every
+  // tick — for hundreds of simulated years in testing — while permanently starving
+  // out any other action that might have actually helped.
+  if (builtSomething) return true;
+  return TileUtils.isRoad(this.map.getTileValue(x, y)) && this.map.getTile(x, y).isConductive();
 };
 
 
