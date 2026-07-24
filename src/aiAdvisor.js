@@ -340,8 +340,25 @@ AIAdvisor.prototype._analyzePower = function(census, budget) {
   var utilization = estConsumption / maxPower;
   var zonesUntilFull = Math.floor((maxPower - estConsumption) / TILES_PER_ZONE);
 
+  // The TILES_PER_ZONE estimate above is a simplification of what the engine's real
+  // power-flood algorithm (powerManager.js's doPowerScan) actually does: it walks
+  // every conductive tile from each plant and aborts the whole scan once total tiles
+  // *visited* exceeds capacity — and that walk revisits (double-counts) tiles at
+  // every branch/intersection in the road+wire network (see the "buggy" comment in
+  // powerManager.js itself), so real consumption is reliably higher than this
+  // estimate once the network has any real complexity to it. Relying on the
+  // estimate alone meant a persistently high unpoweredZoneCount kept getting
+  // diagnosed as "wiring problem, not capacity" (utilization still reads low) and
+  // the AI would just keep retrying wire_connect forever on zones that were never
+  // going to get power without more plants — confirmed in testing keeping 20-40%+
+  // of zones permanently dark for hundreds of simulated years. Trust the empirical
+  // signal over the model: if a meaningful share of zones are unpowered despite
+  // wiring attempts, build more capacity regardless of what the estimate says.
+  var unpoweredFraction = totalZones > 0 ? census.unpoweredZoneCount / totalZones : 0;
+  var estimateLooksWrong = census.unpoweredZoneCount > 15 && unpoweredFraction > 0.15;
+
   // Only build new plant when utilization exceeds threshold
-  if (utilization > POWER_BUILD_THRESHOLD || zonesUntilFull < 8) {
+  if (utilization > POWER_BUILD_THRESHOLD || zonesUntilFull < 8 || estimateLooksWrong) {
     // Nuclear only when: already have 2+ coal AND large city AND cheaper than 3rd coal
     if (coalPlants >= 2 && nuclearPlants === 0 &&
         totalZones >= NUCLEAR_MIN_ZONES &&
