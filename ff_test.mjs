@@ -151,6 +151,12 @@ const result = await page.evaluate(async (years) => {
     industrial: advisor.findGridExpansionRoads('industrial'),
   };
 
+  const multiHubDebug = {
+    ticksSinceZoneGrowth: advisor._ticksSinceZoneGrowth,
+    lastSeenZoneCount: advisor._lastSeenZoneCount,
+    newStarterLocation: advisor.findStarterLocation(),
+  };
+
   let policeAreaClearCount = 0, policeCandidateCount = 0;
   for (let y = 2; y < map.height - 2; y += 2) {
     for (let x = 2; x < map.width - 2; x += 2) {
@@ -336,6 +342,7 @@ const result = await page.evaluate(async (years) => {
     placementDiagnostic,
     terrainCensus,
     gridExpansionDebug,
+    multiHubDebug,
     valveDebug,
     buildAttemptDebug,
     serviceDebug,

@@ -84,6 +84,14 @@ function AIAdvisor(simulation, gameMap, blockMaps) {
     gridOriginX: 0,
     gridOriginY: 0
   };
+
+  // Tracks real stagnation directly, rather than inferring it from
+  // findGridExpansionRoads returning null — that function can keep returning SOME
+  // candidate (one that then fails a later check, like job-distance or lateral
+  // clearance) even once actual zone-count growth has genuinely stopped, which
+  // made the "no candidates found" signal too narrow to catch real stagnation.
+  this._lastSeenZoneCount = -1;
+  this._ticksSinceZoneGrowth = 0;
 }
 
 
@@ -409,11 +417,49 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
   var phase = this._getPhase();
 
+  // Track real stagnation directly (see the constructor comment) instead of
+  // inferring it from findGridExpansionRoads returning null, which can keep
+  // returning SOME candidate that then fails a later check even once actual growth
+  // has genuinely stopped.
+  if (totalZones !== this._lastSeenZoneCount) {
+    this._lastSeenZoneCount = totalZones;
+    this._ticksSinceZoneGrowth = 0;
+  } else {
+    this._ticksSinceZoneGrowth++;
+  }
+
   // Bootstrap: build starter city
   if (totalZones === 0 && census.totalPop === 0 && budget.totalFunds >= 4500) {
     recs.push({
       priority: PRIORITIES.ZONE_DEMAND + 15,
       message: 'Building starter city: 1 coal + 3R+1C+2I (~$4500).',
+      action: { type: 'build_starter' }
+    });
+    return recs;
+  }
+
+  // Multi-hub expansion: census totals (population, valves, zone counts, ...) are
+  // tracked map-wide by the engine's mapScanner regardless of physical road/wire
+  // connectivity — completely separate, unconnected settlements on the same map
+  // still sum into the same city-wide population. Once the existing hub(s) have
+  // genuinely stopped growing (zone count hasn't moved in a long time) despite
+  // healthy funds, the single-hub architecture has no way to keep growing even with
+  // a mostly empty large map. Rather than sit on a growing pile of unused cash,
+  // start an entirely new, independent starter city elsewhere. Each new district
+  // also gets its own dedicated power plant(s) and its own local road/wire network,
+  // which sidesteps the single shared grid's power-flood-fill tile-traversal budget
+  // (powerManager.js's doPowerScan aborts once total tiles visited exceeds plant
+  // capacity, regardless of zone count) that caps how large any ONE connected
+  // network can grow before sections go permanently dark.
+  if (totalZones > 0 && budget.totalFunds >= 5500 && this._ticksSinceZoneGrowth > 200) {
+    recs.push({
+      // Unambiguously above every other tier (bar EMERGENCY) rather than tied with
+      // ZONE_DEMAND's usual range, so it can't lose a same-priority tie-break
+      // against something like the boosted zero-coverage services recommendation
+      // and go untried for another 200+ ticks before getting another chance.
+      priority: PRIORITIES.POWER + 1,
+      message: 'Existing district(s) stalled (' + this._ticksSinceZoneGrowth +
+        ' ticks with no new zones). Starting a new independent district ($4500).',
       action: { type: 'build_starter' }
     });
     return recs;
