@@ -110,9 +110,18 @@ AIAdvisor.prototype.findStarterLocation = function() {
   var cx = this.map.cityCentreX;
   var cy = this.map.cityCentreY;
 
-  // Need area for T-grid: 15 wide x 15 tall
-  // Wider to fit grid-aligned zones at gx-6, gx-2, gx+2, gx+6
-  // Layout: (gx-7, gy-3) to (gx+7, gy+11)
+  // Need area for T-grid: 15 wide x 15 tall (x: gx-7..gx+7, y: gy-3..gy+11 — the
+  // coal plant lands as far out as gy+9, occupying up to roughly gy+11 as a 4x4).
+  // There used to be a "smaller fallback" here checking only 13x12 (x: gx-6..gx+6,
+  // y: gy-3..gy+8) — narrower AND shorter than what _buildStarterCity actually
+  // builds. It never built a correspondingly smaller city; it just let the same
+  // fixed offsets (including the coal plant at gy+9, past the fallback's verified
+  // gy+8 edge) place tools on unverified — sometimes out-of-bounds — tiles. On a
+  // small (60x50) map, confirmed this crashes the whole simulation (GameMap.getTile
+  // reading a corrupted/undefined tile in a later mapScan pass). Removed: if the
+  // full 15x15 footprint doesn't fit anywhere near centre, there's no safe smaller
+  // plan to fall back to with these fixed offsets, so return null and let the AI
+  // wait/retry rather than build somewhere it can't actually verify is safe.
   for (var r = 0; r < 40; r++) {
     for (var dy = -r; dy <= r; dy++) {
       for (var dx = -r; dx <= r; dx++) {
@@ -120,20 +129,6 @@ AIAdvisor.prototype.findStarterLocation = function() {
         var gx = cx + dx;
         var gy = cy + dy;
         if (this._isAreaClear(gx - 7, gy - 3, 15, 15)) {
-          return { x: gx, y: gy };
-        }
-      }
-    }
-  }
-
-  // Fallback: smaller area
-  for (var r = 0; r < 40; r++) {
-    for (var dy = -r; dy <= r; dy++) {
-      for (var dx = -r; dx <= r; dx++) {
-        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
-        var gx = cx + dx;
-        var gy = cy + dy;
-        if (this._isAreaClear(gx - 6, gy - 3, 13, 12)) {
           return { x: gx, y: gy };
         }
       }
@@ -627,9 +622,21 @@ AIAdvisor.prototype._analyzeServices = function(census, budget) {
   var totalPop = census.totalPop;
   var canAfford = budget.totalFunds >= 500 + COMFORTABLE_FUNDS;
 
+  // Zero coverage gets a much higher priority than routine services maintenance
+  // (PRIORITIES.SERVICES + 10, below ZONE_DEMAND/ROAD_CONNECT/WIRE_CONNECT) — that
+  // tier meant this recommendation, however urgent-sounding, would only ever get
+  // tried on a tick where zone-building, road-connecting, AND wire-connecting all
+  // failed, which in a healthy growing city is close to never. Confirmed in testing:
+  // policeStationPop/fireStationPop stayed at 0 for 200+ simulated years despite
+  // funds being ample and findBestZoneLocation('police') returning a perfectly good
+  // spot every time it was checked — the recommendation was correct, it just never
+  // got a turn. Crime directly reduces land value (see blockMapUtils.js's
+  // pollutionTerrainLandValueScan, -20 for high crime), and land value is what
+  // gates zone growth (residential.js's growZone), so going without ANY police/fire
+  // coverage for centuries was quietly capping how big the city could ever get.
   if (totalPop > 60 && census.policeStationPop === 0 && canAfford) {
     recs.push({
-      priority: PRIORITIES.SERVICES + 10,
+      priority: PRIORITIES.ROAD_CONNECT + 5,
       message: 'No police! Crime rising. Building station ($500).',
       action: { type: 'build', tool: 'police' }
     });
@@ -637,7 +644,7 @@ AIAdvisor.prototype._analyzeServices = function(census, budget) {
 
   if (totalPop > 60 && census.fireStationPop === 0 && canAfford) {
     recs.push({
-      priority: PRIORITIES.SERVICES + 10,
+      priority: PRIORITIES.ROAD_CONNECT + 5,
       message: 'No fire dept! Building station ($500).',
       action: { type: 'build', tool: 'fire' }
     });
@@ -836,6 +843,29 @@ AIAdvisor.prototype.findGridExpansionRoads = function(zoneType) {
         var stub = extendLine(x, y, dx, dy, STUB_LENGTH);
         if (stub.length < 4) continue;
 
+        // Require genuine lateral clearance at the midpoint, not just a 1-tile-wide
+        // corridor: a thin gap between two existing buildings can easily satisfy "4
+        // consecutive open tiles" without ever having room for an actual 3x3 zone
+        // next to it. Without this check the search kept finding and re-stubbing
+        // those dead corridors near the centre (where "prefer closer to centre"
+        // scoring wants to build) instead of ever reaching a spot with real room —
+        // confirmed in testing this caused zone building to freeze solid for 100+
+        // simulated years with over half the map still open. Checking for open
+        // ground on both sides of the midpoint is what actually distinguishes a
+        // buildable pocket from a dead-end sliver, which is a more direct fix than
+        // avoiding the city centre altogether (land value in this engine decays with
+        // distance from the map's centre point, so pushing expansion away from it —
+        // which an earlier version of this function did — quietly caps how much any
+        // zone built out there can ever grow).
+        // Only one side needs to be open (a zone can back onto the existing road's
+        // other neighbor or an already-built structure on the far side) — requiring
+        // both sides turned out to reject essentially every candidate on the whole
+        // map once the city was reasonably built up, freezing expansion entirely.
+        var mid = stub[Math.floor(stub.length / 2)];
+        if (!isBuildable(mid.x + dy, mid.y + dx) && !isBuildable(mid.x - dy, mid.y - dx)) {
+          continue;
+        }
+
         // Don't push the residential frontier out past commuting range: findBestZoneLocation
         // hard-rejects any residential candidate beyond MAX_TRAFFIC_DISTANCE from a job
         // zone, so a stub built further out than that is land nothing can ever actually
@@ -858,20 +888,19 @@ AIAdvisor.prototype.findGridExpansionRoads = function(zoneType) {
           if (zoneType === 'residential' && endY <= gy) score += 100;
           if (zoneType === 'industrial' && endY > gy) score += 100;
         }
-        // Prefer extensions further from the built-up centre, not closer to it.
-        // Preferring compactness here sounds reasonable but backfires badly: nearly
-        // every road tile deep inside an already-developed area has SOME direction
-        // with a few clear tiles (a gap between existing structures), so "closest to
-        // centre" kept picking those over genuine frontier tiles at the city's edge —
-        // repeatedly re-stubbing small gaps near the middle instead of pushing the
-        // boundary outward. Confirmed in testing: zone building would freeze solid
-        // for 100+ simulated years with over half the map's tiles still open dirt,
-        // because the thin road network had already spread (via these central
-        // micro-stubs) into nearly every remaining pocket without ever reaching the
-        // wide open land further out, leaving no 3x3 gap anywhere big enough for a
-        // zone. Rewarding distance from centre instead pushes new roads toward the
-        // genuine, unclaimed frontier where there's actual room to build.
-        score += Math.abs(x - map.cityCentreX) + Math.abs(y - map.cityCentreY);
+        // Prefer extensions CLOSER to the map's geometric centre. This isn't just
+        // about compactness: land value in this engine is computed from Manhattan
+        // distance to map.cityCentreX/Y and decays hard with distance (see
+        // pollutionTerrainLandValueScan in blockMapUtils.js) — and zone growth itself
+        // is gated on land value (residential.js's growZone only fires often enough
+        // to matter when landValue clears roughly 80+, which corresponds to distance
+        // less than ~25-30 tiles from centre). A zone built far from centre can be
+        // powered, roaded, and fully "valid" by every other check here and still
+        // barely ever grow past its starting stage. Expansion should exhaust the
+        // genuinely high-value land near the centre before reaching further out —
+        // the lateral-clearance check above (not distance-from-centre) is what
+        // prevents this from degenerating into re-stubbing the same dead corridors.
+        score -= Math.abs(x - map.cityCentreX) + Math.abs(y - map.cityCentreY);
 
         if (score > bestScore) {
           bestScore = score;
@@ -999,8 +1028,18 @@ AIAdvisor.prototype._bfsPath = function(startX, startY, canTraverse, isGoal, max
 };
 
 
-var isOpenOrRoad = function(tv) {
-  return tv === TileValues.DIRT || TileUtils.canBulldoze(tv) || TileUtils.isRoad(tv);
+// Includes open water: roadTool.layRoad can lay a bridge over water (see
+// roadTool.js), one tile at a time, as long as the tile on one side is already a
+// placed road/bridge — so water is traversable for pathfinding purposes, it just
+// needs the resulting path built in the right order (see findRoadPath below).
+// Without this, a land pocket separated from the rest of the city by so much as a
+// single river tile was permanently unreachable — confirmed in testing this leaves
+// large stretches of a map (sometimes 40%+ of all open land) forever unused even
+// with abundant funds and zone demand, because the AI never even considered
+// building the bridge that would have connected it.
+var isOpenRoadOrWater = function(tv) {
+  return tv === TileValues.DIRT || TileUtils.canBulldoze(tv) || TileUtils.isRoad(tv) ||
+    (tv >= TileValues.WATER_LOW && tv <= TileValues.WATER_HIGH);
 };
 
 
@@ -1009,8 +1048,14 @@ AIAdvisor.prototype.findRoadPath = function(fromX, fromY, toX, toY) {
   var isGoal = function(x, y, tv) {
     return (x === toX && y === toY) || TileUtils.isRoad(tv);
   };
-  var path = this._bfsPath(fromX, fromY, function(tv) { return isOpenOrRoad(tv); }, isGoal);
+  var path = this._bfsPath(fromX, fromY, function(tv) { return isOpenRoadOrWater(tv); }, isGoal);
   if (!path) return [];
+  // roadTool's bridge mechanic only succeeds if the tile on one side is already a
+  // placed road — path[] runs from the disconnected point to the existing road, so
+  // building in that order tries to bridge outward from open water into nothing.
+  // Reversed, each new tile (working backward from the existing road toward the
+  // disconnected point) always has a just-placed road neighbor behind it.
+  path.reverse();
   // Only the tiles that actually need a road laid — drop any pre-existing road
   // (typically the goal itself, when we routed toward an existing junction).
   return path.filter(function(pos) {
@@ -1031,9 +1076,12 @@ AIAdvisor.prototype.findRoadToConnect = function() {
       if (this._hasAdjacentRoad(x, y)) continue;
 
       var path = this._bfsPath(x, y,
-        function(tv) { return isOpenOrRoad(tv); },
+        function(tv) { return isOpenRoadOrWater(tv); },
         function(nx, ny, tv) { return TileUtils.isRoad(tv); });
-      if (path && path.length > 0) return path;
+      // See findRoadPath: a bridge can only be placed one tile at a time working
+      // outward from an already-placed road, so build in that order (from the
+      // existing road back toward the disconnected zone), not the BFS discovery order.
+      if (path && path.length > 0) return path.reverse();
     }
   }
 
@@ -1073,13 +1121,17 @@ AIAdvisor.prototype.findWireToConnect = function() {
 AIAdvisor.prototype._findWirePath = function(fromX, fromY) {
   var map = this.map;
   var canTraverse = function(tv, tile) {
-    return isOpenOrRoad(tv) || tile.isConductive();
+    return isOpenRoadOrWater(tv) || tile.isConductive();
   };
   var isGoal = function(x, y, tv, tile) {
     return tile.isPowered();
   };
   var path = this._bfsPath(fromX, fromY, canTraverse, isGoal);
   if (!path) return null;
+  // Same reasoning as findRoadPath: wireTool's water-crossing case also needs an
+  // already-conductive neighbor to place the next tile, so build outward from the
+  // powered end (path.length-1) back toward the zone, not BFS discovery order.
+  path.reverse();
   return path.filter(function(pos) {
     return !map.getTile(pos.x, pos.y).isConductive();
   });

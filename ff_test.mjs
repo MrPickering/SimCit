@@ -151,6 +151,23 @@ const result = await page.evaluate(async (years) => {
     industrial: advisor.findGridExpansionRoads('industrial'),
   };
 
+  let policeAreaClearCount = 0, policeCandidateCount = 0;
+  for (let y = 2; y < map.height - 2; y += 2) {
+    for (let x = 2; x < map.width - 2; x += 2) {
+      policeCandidateCount++;
+      if (advisor._isAreaClear(x - 1, y - 1, 3)) policeAreaClearCount++;
+    }
+  }
+
+  const serviceDebug = {
+    police: advisor.findBestZoneLocation('police'),
+    fire: advisor.findBestZoneLocation('fire'),
+    policeStationPop: sim._census.policeStationPop,
+    fireStationPop: sim._census.fireStationPop,
+    funds: sim.budget.totalFunds,
+    policeAreaClearCount, policeCandidateCount,
+  };
+
   // Actually try to execute the road tool on the industrial candidate's tiles (we're
   // at the very end of the run, so committing this doesn't affect anything else we
   // care about) and record the real TOOLRESULT code for each — this tells us exactly
@@ -321,6 +338,7 @@ const result = await page.evaluate(async (years) => {
     gridExpansionDebug,
     valveDebug,
     buildAttemptDebug,
+    serviceDebug,
   };
 }, YEARS);
 
