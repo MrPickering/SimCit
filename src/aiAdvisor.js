@@ -85,13 +85,18 @@ function AIAdvisor(simulation, gameMap, blockMaps) {
     gridOriginY: 0
   };
 
-  // Tracks real stagnation directly, rather than inferring it from
-  // findGridExpansionRoads returning null — that function can keep returning SOME
-  // candidate (one that then fails a later check, like job-distance or lateral
-  // clearance) even once actual zone-count growth has genuinely stopped, which
-  // made the "no candidates found" signal too narrow to catch real stagnation.
-  this._lastSeenZoneCount = -1;
-  this._ticksSinceZoneGrowth = 0;
+  // Tracks the zone-count GROWTH RATE over a rolling checkpoint window, rather than
+  // inferring stagnation from findGridExpansionRoads returning null (that function
+  // can keep returning SOME candidate that then fails a later check even once real
+  // growth has stopped) or from a simple "reset the counter on ANY change" freeze
+  // detector (verified via reproducible seeded test runs: some maps genuinely grow
+  // at a crawl — roughly +1 zone every 10-40 simulated years — which resets a naive
+  // freeze counter before it ever accumulates, even though that growth rate is
+  // clearly inadequate). Every CHECKPOINT_TICKS ticks, compare current zone count
+  // against the value recorded at the start of that window.
+  this._zoneCountAtCheckpoint = -1;
+  this._ticksSinceCheckpoint = 0;
+  this._recentZoneGrowthRate = Infinity; // no data yet — don't treat as stalled
 }
 
 
@@ -417,15 +422,18 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   var totalZones = census.poweredZoneCount + census.unpoweredZoneCount;
   var phase = this._getPhase();
 
-  // Track real stagnation directly (see the constructor comment) instead of
-  // inferring it from findGridExpansionRoads returning null, which can keep
-  // returning SOME candidate that then fails a later check even once actual growth
-  // has genuinely stopped.
-  if (totalZones !== this._lastSeenZoneCount) {
-    this._lastSeenZoneCount = totalZones;
-    this._ticksSinceZoneGrowth = 0;
-  } else {
-    this._ticksSinceZoneGrowth++;
+  // Track the zone-count growth RATE over a rolling checkpoint window (see the
+  // constructor comment for why a simple freeze-detector doesn't work).
+  var CHECKPOINT_TICKS = 400; // ~8.3 simulated years
+  var MIN_GROWTH_PER_WINDOW = 10; // need at least this many new zones per window
+  this._ticksSinceCheckpoint++;
+  if (this._zoneCountAtCheckpoint === -1) {
+    this._zoneCountAtCheckpoint = totalZones;
+    this._ticksSinceCheckpoint = 0;
+  } else if (this._ticksSinceCheckpoint >= CHECKPOINT_TICKS) {
+    this._recentZoneGrowthRate = totalZones - this._zoneCountAtCheckpoint;
+    this._zoneCountAtCheckpoint = totalZones;
+    this._ticksSinceCheckpoint = 0;
   }
 
   // Bootstrap: build starter city
@@ -451,15 +459,15 @@ AIAdvisor.prototype._analyzeZoneDemand = function(census, valves, budget) {
   // (powerManager.js's doPowerScan aborts once total tiles visited exceeds plant
   // capacity, regardless of zone count) that caps how large any ONE connected
   // network can grow before sections go permanently dark.
-  if (totalZones > 0 && budget.totalFunds >= 5500 && this._ticksSinceZoneGrowth > 200) {
+  if (totalZones > 0 && budget.totalFunds >= 5500 && this._recentZoneGrowthRate < MIN_GROWTH_PER_WINDOW) {
     recs.push({
       // Unambiguously above every other tier (bar EMERGENCY) rather than tied with
       // ZONE_DEMAND's usual range, so it can't lose a same-priority tie-break
       // against something like the boosted zero-coverage services recommendation
-      // and go untried for another 200+ ticks before getting another chance.
+      // and go untried for another window before getting another chance.
       priority: PRIORITIES.POWER + 1,
-      message: 'Existing district(s) stalled (' + this._ticksSinceZoneGrowth +
-        ' ticks with no new zones). Starting a new independent district ($4500).',
+      message: 'Existing district(s) growing too slowly (' + this._recentZoneGrowthRate +
+        ' zones/' + CHECKPOINT_TICKS + ' ticks). Starting a new independent district ($4500).',
       action: { type: 'build_starter' }
     });
     return recs;
