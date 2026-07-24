@@ -8,20 +8,55 @@ import { chromium } from 'playwright';
 const URL = process.env.SIMCIT_URL || 'http://localhost:8080/';
 const YEARS = parseInt(process.env.FF_YEARS || '80', 10);
 const MAP_SIZE = process.env.FF_MAP || '120x100';
+// The engine has no seed support (random.ts calls Math.random() directly), so every
+// run previously got a different random map — a huge confound when comparing AI
+// changes across test runs (there was no way to tell "this change helped" from
+// "this map happened to be nicer"). Default to a fixed seed so repeated runs are
+// reproducible by default; pass FF_SEED to explore variance deliberately.
+const SEED = parseInt(process.env.FF_SEED || '42', 10);
 
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
 
-page.on('console', msg => {
-  const t = msg.text();
-  if (/error/i.test(t)) console.log('[console]', t);
-});
-page.on('pageerror', err => console.log('[pageerror]', err.message));
+// Deterministic PRNG (mulberry32) injected before any page script runs, so it's in
+// place for MapGenerator and every other Math.random() call the game makes for the
+// entire run — not just map generation, so AI tie-breaks / stochastic zone growth
+// checks (residential.js's growZone 9%-chance-per-check mechanic, etc.) are also
+// reproducible run to run given the same seed and the same AI code.
+await page.addInitScript((seed) => {
+  let state = seed >>> 0;
+  Math.random = function() {
+    state |= 0; state = (state + 0x6D2B79F5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}, SEED);
+
+console.log('Using seed:', SEED);
 
 await page.goto(URL, { waitUntil: 'load' });
 
 // Pick map size, click Play on splash, then submit name/difficulty form.
 await page.waitForSelector('#splashPlay', { state: 'visible', timeout: 15000 });
+
+// Re-seed right before triggering the map regeneration we actually care about: the
+// splash screen's initial (default-size) map + whatever asset-loading happened
+// beforehand consume an indeterminate number of Math.random() calls depending on
+// timing, so the PRNG state at this exact point isn't reproducible run to run even
+// with the same initial seed. Installing a fresh, deterministic generator right
+// here — immediately before selectOption's 'change' handler calls MapGenerator
+// again — pins down the one map generation that actually matters for the test.
+await page.evaluate((seed) => {
+  let state = seed >>> 0;
+  Math.random = function() {
+    state |= 0; state = (state + 0x6D2B79F5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}, SEED);
+
 await page.selectOption('#mapSize', MAP_SIZE);
 // Let the map regenerate for the new size selection.
 await page.waitForTimeout(200);
