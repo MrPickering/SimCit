@@ -1345,7 +1345,11 @@ AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
   else if (this._hasNearbyRoad(x, y, 8)) score += 20;
   else score -= 150;
 
-  if (this._hasNearbyPower(x, y, 6)) score += 40;
+  // Power plants deliberately skip this generic "near existing power" bonus below
+  // (see the coal/nuclear case) — it's the opposite of what they need.
+  if (toolName !== 'coal' && toolName !== 'nuclear' && this._hasNearbyPower(x, y, 6)) {
+    score += 40;
+  }
 
   var landValue = this._safeBlockGet(blockMaps.landValueMap, x, y);
 
@@ -1357,6 +1361,19 @@ AIAdvisor.prototype._scoreLargeLocation = function(x, y, toolName) {
       // Prefer near industrial
       if (this._hasNearbyIndustrial(x, y, 10)) score += 30;
       score -= landValue;
+      // Spread plants out across the city rather than clustering them together.
+      // The generic "near existing power" bonus above (skipped here) would actively
+      // reward clustering new plants next to old ones — but the engine's power
+      // flood-fill algorithm (powerManager.js) has its own tile-traversal budget
+      // separate from raw plant capacity, and it double-counts at every
+      // branch/intersection in the conductive network. A more spread-out set of
+      // plants means shorter average flood-fill paths from any given zone to its
+      // nearest plant, which burns less of that budget reaching the same total
+      // number of zones — confirmed in testing that a persistently high fraction of
+      // unpowered zones often isn't fixed by adding capacity alone if all the
+      // plants sit in the same corner of the city.
+      if (this._hasNearbyBuilding(x, y, TileValues.POWERPLANT, 20)) score -= 400;
+      if (this._hasNearbyBuilding(x, y, TileValues.NUCLEAR, 20)) score -= 400;
       break;
 
     case 'stadium':
