@@ -810,13 +810,23 @@ AIAdvisor.prototype.findGridExpansionRoads = function(zoneType) {
   var height = map.height;
   var gy = this._plan.initialized ? this._plan.gridOriginY : null;
   var dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-  var STUB_LENGTH = 6;
+  var STUB_LENGTH = 10;
   var CROSS_LENGTH = 6;
 
+  // Includes open water: roadTool can lay a bridge one tile at a time as long as
+  // the neighboring tile is already a placed road — this function already builds
+  // sequentially outward from a known existing road (step 1, 2, 3, ... in order,
+  // and _expandGrid places them in that same order), so unlike the reconnection
+  // pathfinders (findRoadPath etc.) no reordering is needed here for the bridge
+  // mechanic to work. Without this, a land pocket separated from the rest of a map
+  // by even a single river tile was permanently unreachable for NEW zone building —
+  // confirmed via a terrain census showing 40%+ of some maps sitting unused, split
+  // off by water, while the AI's own connected territory had fully saturated.
   var isBuildable = function(x, y) {
     if (x < 2 || y < 2 || x >= width - 2 || y >= height - 2) return false;
     var tv = map.getTileValue(x, y);
-    return tv === TileValues.DIRT || TileUtils.canBulldoze(tv);
+    return tv === TileValues.DIRT || TileUtils.canBulldoze(tv) ||
+      (tv >= TileValues.WATER_LOW && tv <= TileValues.WATER_HIGH);
   };
 
   var extendLine = function(fromX, fromY, dx, dy, length) {
@@ -842,6 +852,12 @@ AIAdvisor.prototype.findGridExpansionRoads = function(zoneType) {
         var dy = dirs[d][1];
         var stub = extendLine(x, y, dx, dy, STUB_LENGTH);
         if (stub.length < 4) continue;
+
+        // If the stub is still over water at its far end, it's a bridge that
+        // doesn't reach anywhere useful yet (no shore to build zones on within the
+        // length budget) — skip it rather than spend the cost on a dead-end pier.
+        var lastTv = map.getTileValue(stub[stub.length - 1].x, stub[stub.length - 1].y);
+        if (lastTv >= TileValues.WATER_LOW && lastTv <= TileValues.WATER_HIGH) continue;
 
         // Require genuine lateral clearance at the midpoint, not just a 1-tile-wide
         // corridor: a thin gap between two existing buildings can easily satisfy "4
@@ -888,19 +904,21 @@ AIAdvisor.prototype.findGridExpansionRoads = function(zoneType) {
           if (zoneType === 'residential' && endY <= gy) score += 100;
           if (zoneType === 'industrial' && endY > gy) score += 100;
         }
-        // Prefer extensions CLOSER to the map's geometric centre. This isn't just
-        // about compactness: land value in this engine is computed from Manhattan
-        // distance to map.cityCentreX/Y and decays hard with distance (see
-        // pollutionTerrainLandValueScan in blockMapUtils.js) — and zone growth itself
-        // is gated on land value (residential.js's growZone only fires often enough
-        // to matter when landValue clears roughly 80+, which corresponds to distance
-        // less than ~25-30 tiles from centre). A zone built far from centre can be
-        // powered, roaded, and fully "valid" by every other check here and still
-        // barely ever grow past its starting stage. Expansion should exhaust the
-        // genuinely high-value land near the centre before reaching further out —
-        // the lateral-clearance check above (not distance-from-centre) is what
-        // prevents this from degenerating into re-stubbing the same dead corridors.
-        score -= Math.abs(x - map.cityCentreX) + Math.abs(y - map.cityCentreY);
+        // No distance-from-centre term here, deliberately, after testing both
+        // directions found a real conflict with no clean winner: land value decays
+        // with distance from map.cityCentreX/Y (blockMapUtils.js's
+        // pollutionTerrainLandValueScan), so "prefer closer" grows each zone denser,
+        // but cityPop sums population across ALL zones (not an average), so "prefer
+        // farther" reaches more total zones' worth of land on a large map. Testing
+        // showed farther expansion also strains the power grid harder — the
+        // engine's power-flood algorithm (powerManager.js) has its own tile-traversal
+        // budget independent of plant capacity, and a more spread-out, farther-flung
+        // road/wire network hits that ceiling sooner, leaving a larger fraction of
+        // zones permanently unpowered (confirmed up to 41% in one run) — which then
+        // barely contribute anything anyway (growZone hard-penalizes unpowered
+        // zones). Neither extreme reliably won across test runs, so the distance
+        // term is left out; the lateral-clearance check above (not distance) is what
+        // actually prevents re-stubbing the same dead corridor forever.
 
         if (score > bestScore) {
           bestScore = score;
